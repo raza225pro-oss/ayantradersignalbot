@@ -11,7 +11,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()
 
-# --- Flask Setup ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -26,12 +25,15 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-# --- Bot Setup ---
 TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
 PKT = timezone(timedelta(hours=5))
 
-exchange = ccxt.binanceusdm({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+# Binance Futures API
+exchange = ccxt.binanceusdm({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}
+})
 
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 
@@ -44,12 +46,14 @@ SYMBOLS = [
 
 def get_signal(symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=50)
-        if not ohlcv: return None
+        # Timeframe 5m aur limit 100
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
+        if not ohlcv or len(ohlcv) < 30: 
+            return None
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Indicators calculate karein
+        # Indicators
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -59,49 +63,35 @@ def get_signal(symbol):
         df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
         
-        df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        
         last = df.iloc[-1]
+        prev = df.iloc[-2]
         
-        direction, confidence, reason = None, 0, []
+        direction = None
+        confidence = 0
+        reason = []
 
-        # --- RELAXED LOGIC (Koi bhi ek indicator match ho toh signal) ---
-        
-        # 1. UPAR ka Signal
-        if last['ema_fast'] > last['ema_slow']: # EMA Up
-            confidence = 60
-            reason.append("EMA Up")
-        elif last['macd'] > last['macd_signal']: # MACD Up
-            confidence = 60
-            reason.append("MACD Up")
-        elif last['rsi'] > 55: # RSI Up
-            confidence = 60
-            reason.append("RSI Up")
-
-        # 2. NEECHAY ka Signal
-        if last['ema_fast'] < last['ema_slow']: # EMA Down
-            if confidence == 0: confidence = 60
-            else: confidence = 70 # Agar 2 indicator match karein toh zyada confidence
-            reason.append("EMA Down")
-        elif last['macd'] < last['macd_signal']: # MACD Down
-            if confidence == 0: confidence = 60
-            else: confidence = 70
-            reason.append("MACD Down")
-        elif last['rsi'] < 45: # RSI Down
-            if confidence == 0: confidence = 60
-            else: confidence = 70
-            reason.append("RSI Down")
-
-        # Direction set karein based on the strongest indicator
-        if "Down" in " ".join(reason):
-            direction = "NEECHAY (SHORT) 📉"
-            if "Up" in " ".join(reason):
-                direction = "MIXED (Wait) ⚖️" # Agar dono taraf ke signals hon
-        elif "Up" in " ".join(reason):
+        # BOHAT ASAN LOGIC (Koi bhi ek cheez match ho toh)
+        # 1. Agar price EMA9 se upar hai
+        if last['close'] > last['ema_fast']:
             direction = "UPAR (LONG) 📈"
+            confidence = 65
+            reason.append("Price > EMA9")
+        
+        # 2. Agar price EMA9 se neeche hai
+        elif last['close'] < last['ema_fast']:
+            direction = "NEECHAY (SHORT) 📉"
+            confidence = 65
+            reason.append("Price < EMA9")
 
-        if direction and confidence >= 60:
+        # RSI se confidence barhayein
+        if last['rsi'] > 60 and direction and "UPAR" in direction:
+            confidence = 75
+            reason.append("RSI > 60")
+        elif last['rsi'] < 40 and direction and "NEECHAY" in direction:
+            confidence = 75
+            reason.append("RSI < 40")
+
+        if direction:
             now_pkt = datetime.now(PKT).strftime("%I:%M %p")
             return {
                 'symbol': symbol, 'direction': direction, 'confidence': confidence,
@@ -109,28 +99,29 @@ def get_signal(symbol):
             }
             
     except Exception as e:
-        pass
+        # Agar kisi coin mein error aaye toh print karein taake pata chale
+        print(f"Error scanning {symbol}: {str(e)}")
+        return None
     return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Assalam-o-Alaikum! Main aapka Market Scanner Bot hoon.\n\nPoore market ko scan karne ke liye /scan likhein.")
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔍 Poore market ko scan kiya ja raha hai...\nThora intezar karein.")
+    msg = await update.message.reply_text("🔍 Market scan ho raha hai...")
     
     found_signals = []
     for sym in SYMBOLS:
         res = get_signal(sym)
         if res:
             found_signals.append(res)
-        await asyncio.sleep(0.1) # Fast scan
+        await asyncio.sleep(0.2) 
     
     await msg.delete()
     
     if not found_signals:
-        await update.message.reply_text("📊 Market bilkul flat hai. Abhi kuch bhi nahi mila.")
+        await update.message.reply_text("📊 Market mein abhi koi clear trend nahi hai.")
     else:
-        # Top 5 signals
         found_signals.sort(key=lambda x: x['confidence'], reverse=True)
         for sig in found_signals[:5]:
             txt = (
