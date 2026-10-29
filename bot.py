@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()
 
+# --- Flask Setup ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -25,15 +26,12 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
+# --- Bot Setup ---
 TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
 PKT = timezone(timedelta(hours=5))
 
-# Binance Futures API
-exchange = ccxt.binanceusdm({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
+exchange = ccxt.binanceusdm({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
 
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 
@@ -46,22 +44,27 @@ SYMBOLS = [
 
 def get_signal(symbol):
     try:
-        # Timeframe 5m aur limit 100
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
-        if not ohlcv or len(ohlcv) < 30: 
-            return None
+        # Timeframe 1m kar diya hai taake jaldi signals milein
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=100)
+        if not ohlcv or len(ohlcv) < 30: return None
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Indicators
+        # 1. EMA Trend
+        df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
+        
+        # 2. RSI
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
-        df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
+        # 3. Stochastic
+        df['low_14'] = df['low'].rolling(window=14).mean()
+        df['high_14'] = df['high'].rolling(window=14).mean()
+        df['stoch'] = 100 * ((df['close'] - df['low_14']) / (df['high_14'] - df['low_14']))
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
@@ -70,26 +73,49 @@ def get_signal(symbol):
         confidence = 0
         reason = []
 
-        # BOHAT ASAN LOGIC (Koi bhi ek cheez match ho toh)
-        # 1. Agar price EMA9 se upar hai
-        if last['close'] > last['ema_fast']:
-            direction = "UPAR (LONG) 📈"
-            confidence = 65
-            reason.append("Price > EMA9")
-        
-        # 2. Agar price EMA9 se neeche hai
-        elif last['close'] < last['ema_fast']:
-            direction = "NEECHAY (SHORT) 📉"
-            confidence = 65
-            reason.append("Price < EMA9")
+        # --- GUESS & STRATEGY SYSTEM ---
 
-        # RSI se confidence barhayein
-        if last['rsi'] > 60 and direction and "UPAR" in direction:
-            confidence = 75
-            reason.append("RSI > 60")
-        elif last['rsi'] < 40 and direction and "NEECHAY" in direction:
-            confidence = 75
-            reason.append("RSI < 40")
+        # Strategy 1: Trend Following (EMA)
+        if last['ema_9'] > last['ema_21'] and last['close'] > last['ema_9']:
+            direction = "UPAR (LONG) 📈"
+            confidence += 65
+            reason.append("EMA Trend Up")
+        elif last['ema_9'] < last['ema_21'] and last['close'] < last['ema_9']:
+            direction = "NEECHAY (SHORT) 📉"
+            confidence += 65
+            reason.append("EMA Trend Down")
+
+        # Strategy 2: Momentum (RSI & Stoch)
+        if last['rsi'] < 35: # Oversold (Upar jane ke chances)
+            if direction == "NEECHAY (SHORT) 📉": direction = "UPAR (LONG) 📈" # Reversal
+            confidence += 10
+            reason.append("RSI Oversold")
+        elif last['rsi'] > 65: # Overbought (Neeche jane ke chances)
+            if direction == "UPAR (LONG) 📈": direction = "NEECHAY (SHORT) 📉"
+            confidence += 10
+            reason.append("RSI Overbought")
+
+        # Strategy 3: Breakout (Agar koi trend nahi mila)
+        if direction is None:
+            # Agar price ne pichle 10 candles ki high/low break ki hai
+            if last['close'] > df['high'].tail(10).max():
+                direction = "UPAR (LONG) 📈"
+                confidence = 60
+                reason.append("Breakout High")
+            elif last['close'] < df['low'].tail(10).min():
+                direction = "NEECHAY (SHORT) 📉"
+                confidence = 60
+                reason.append("Breakout Low")
+            else:
+                # Agar market bilkul flat hai, toh Guess System (Random based on momentum)
+                if last['close'] > last['open']:
+                    direction = "UPAR (GUESS) 📈"
+                    confidence = 50
+                    reason.append("Momentum Guess")
+                else:
+                    direction = "NEECHAY (GUESS) 📉"
+                    confidence = 50
+                    reason.append("Momentum Guess")
 
         if direction:
             now_pkt = datetime.now(PKT).strftime("%I:%M %p")
@@ -99,10 +125,8 @@ def get_signal(symbol):
             }
             
     except Exception as e:
-        # Agar kisi coin mein error aaye toh print karein taake pata chale
-        print(f"Error scanning {symbol}: {str(e)}")
+        print(f"Error: {e}")
         return None
-    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Assalam-o-Alaikum! Main aapka Market Scanner Bot hoon.\n\nPoore market ko scan karne ke liye /scan likhein.")
@@ -115,22 +139,23 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = get_signal(sym)
         if res:
             found_signals.append(res)
-        await asyncio.sleep(0.2) 
+        await asyncio.sleep(0.1) 
     
     await msg.delete()
     
     if not found_signals:
         await update.message.reply_text("📊 Market mein abhi koi clear trend nahi hai.")
     else:
+        # Top 10 signals bhejein taake market ka poora haal pata chale
         found_signals.sort(key=lambda x: x['confidence'], reverse=True)
-        for sig in found_signals[:5]:
+        for sig in found_signals[:10]:
             txt = (
                 f"🚨 **{sig['symbol']}**\n"
                 f"Direction: {sig['direction']}\n"
                 f"Confidence: {sig['confidence']}%\n"
                 f"Price: ${sig['price']:.4f}\n"
                 f"⏰ Time (PKT): {sig['time_pkt']}\n"
-                f"Reason: {sig['reason']}"
+                f"Strategy: {sig['reason']}"
             )
             await update.message.reply_text(txt, parse_mode='Markdown')
             await asyncio.sleep(0.5)
