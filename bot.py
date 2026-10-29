@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()
 
-# --- Flask Setup (Render Web Service ke liye zaroori) ---
+# --- Flask Setup ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -49,7 +49,7 @@ def get_signal(symbol):
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Indicators
+        # Indicators calculate karein
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -59,37 +59,55 @@ def get_signal(symbol):
         df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
         
-        last, prev = df.iloc[-1], df.iloc[-2]
+        df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        
+        last = df.iloc[-1]
+        
         direction, confidence, reason = None, 0, []
 
-        # UPAR ka Signal (60%+ confidence)
-        if last['ema_fast'] > last['ema_slow'] and last['close'] > last['ema_fast']:
+        # --- RELAXED LOGIC (Koi bhi ek indicator match ho toh signal) ---
+        
+        # 1. UPAR ka Signal
+        if last['ema_fast'] > last['ema_slow']: # EMA Up
             confidence = 60
-            reason.append("EMA Uptrend")
-            if last['rsi'] > 50: 
-                confidence += 20
-                reason.append("RSI > 50")
-            if last['rsi'] > 70:
-                confidence -= 15 
-            direction = "UPAR (LONG) 📈"
+            reason.append("EMA Up")
+        elif last['macd'] > last['macd_signal']: # MACD Up
+            confidence = 60
+            reason.append("MACD Up")
+        elif last['rsi'] > 55: # RSI Up
+            confidence = 60
+            reason.append("RSI Up")
 
-        # NEECHAY ka Signal (60%+ confidence)
-        elif last['ema_fast'] < last['ema_slow'] and last['close'] < last['ema_fast']:
-            confidence = 60
-            reason.append("EMA Downtrend")
-            if last['rsi'] < 50: 
-                confidence += 20
-                reason.append("RSI < 50")
-            if last['rsi'] < 30:
-                confidence -= 15 
+        # 2. NEECHAY ka Signal
+        if last['ema_fast'] < last['ema_slow']: # EMA Down
+            if confidence == 0: confidence = 60
+            else: confidence = 70 # Agar 2 indicator match karein toh zyada confidence
+            reason.append("EMA Down")
+        elif last['macd'] < last['macd_signal']: # MACD Down
+            if confidence == 0: confidence = 60
+            else: confidence = 70
+            reason.append("MACD Down")
+        elif last['rsi'] < 45: # RSI Down
+            if confidence == 0: confidence = 60
+            else: confidence = 70
+            reason.append("RSI Down")
+
+        # Direction set karein based on the strongest indicator
+        if "Down" in " ".join(reason):
             direction = "NEECHAY (SHORT) 📉"
+            if "Up" in " ".join(reason):
+                direction = "MIXED (Wait) ⚖️" # Agar dono taraf ke signals hon
+        elif "Up" in " ".join(reason):
+            direction = "UPAR (LONG) 📈"
 
         if direction and confidence >= 60:
             now_pkt = datetime.now(PKT).strftime("%I:%M %p")
             return {
                 'symbol': symbol, 'direction': direction, 'confidence': confidence,
-                'price': last['close'], 'time_pkt': now_pkt, 'reason': " | ".join(reason)
+                'price': last['close'], 'time_pkt': now_pkt, 'reason': " + ".join(reason)
             }
+            
     except Exception as e:
         pass
     return None
@@ -98,20 +116,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Assalam-o-Alaikum! Main aapka Market Scanner Bot hoon.\n\nPoore market ko scan karne ke liye /scan likhein.")
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔍 Poore market (40+ coins) ko scan kiya ja raha hai...\nThora intezar karein.")
+    msg = await update.message.reply_text("🔍 Poore market ko scan kiya ja raha hai...\nThora intezar karein.")
     
     found_signals = []
     for sym in SYMBOLS:
         res = get_signal(sym)
         if res:
             found_signals.append(res)
-        await asyncio.sleep(0.2) 
+        await asyncio.sleep(0.1) # Fast scan
     
     await msg.delete()
     
     if not found_signals:
-        await update.message.reply_text(f"📊 Poore market mein abhi 60%+ ka koi signal nahi hai.\nTime (PKT): {datetime.now(PKT).strftime('%I:%M %p')}")
+        await update.message.reply_text("📊 Market bilkul flat hai. Abhi kuch bhi nahi mila.")
     else:
+        # Top 5 signals
         found_signals.sort(key=lambda x: x['confidence'], reverse=True)
         for sig in found_signals[:5]:
             txt = (
@@ -130,7 +149,6 @@ async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def run_bot():
     print("Bot thread started...")
-    # No proxy used here, direct connection
     telegram_app = Application.builder().token(TOKEN).build()
     
     telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
@@ -140,10 +158,8 @@ def run_bot():
     telegram_app.run_polling()
 
 if __name__ == "__main__":
-    # 1. Flask background mein chalega
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
-    # 2. Bot main thread mein chalega (Python 3.14 fix)
     run_bot()
