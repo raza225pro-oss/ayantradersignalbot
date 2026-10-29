@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot>=22.2
 ccxt
 pandas
 python-dotenv
