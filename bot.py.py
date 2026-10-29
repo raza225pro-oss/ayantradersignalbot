@@ -1,17 +1,16 @@
 import os
 import asyncio
-import threading
-from flask import Flask
 import ccxt
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
-# --- Flask Setup (Render ke liye) ---
+# --- Flask Setup (Render Web Service ke liye zaroori) ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -75,8 +74,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Market scan ho raha hai...")
-    found = [get_signal(s) for s in SYMBOLS]
-    found = [f for f in found if f]
+    found = []
+    for s in SYMBOLS:
+        res = get_signal(s)
+        if res: found.append(res)
     
     if not found:
         await update.message.reply_text(f"📊 Scan complete. Koi strong signal nahi.\nTime (PKT): {datetime.now(PKT).strftime('%I:%M %p')}")
@@ -88,7 +89,11 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Sorry, aap is bot ko use nahi kar sakte.")
 
+# Global application variable
+telegram_app = None
+
 def run_bot():
+    global telegram_app
     print("Bot thread started...")
     telegram_app = Application.builder().token(TOKEN).build()
     telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
@@ -97,10 +102,12 @@ def run_bot():
     telegram_app.run_polling()
 
 if __name__ == "__main__":
-    # Bot ko alag thread mein chalayein
+    # Bot ko background thread mein start karein
+    import threading
     bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
     bot_thread.start()
     
-    # Flask server ko main thread mein chalayein (Render ke liye)
+    # Flask ko main thread mein chalayein (Render isi ko dhoondta hai)
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
