@@ -1,16 +1,17 @@
 import os
 import asyncio
+import threading
+from flask import Flask
 import ccxt
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
-# --- Flask Setup (Render Web Service ke liye zaroori) ---
+# --- Flask Setup (Render ke liye) ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -89,13 +90,17 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Sorry, aap is bot ko use nahi kar sakte.")
 
-# Global application variable
 telegram_app = None
 
 def run_bot():
     global telegram_app
     print("Bot thread started...")
-    telegram_app = Application.builder().token(TOKEN).build()
+    
+    # Yahan Cloudflare Proxy ka URL set kiya gaya hai
+    base_url = os.getenv("TELEGRAM_API_BASE", "https://flat-snow-1099.raza225pro.workers.dev")
+    
+    telegram_app = Application.builder().token(TOKEN).base_url(base_url).build()
+    
     telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
@@ -103,7 +108,6 @@ def run_bot():
 
 if __name__ == "__main__":
     # Bot ko background thread mein start karein
-    import threading
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
