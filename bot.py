@@ -1,7 +1,7 @@
 import os
 import asyncio
 import threading
-from flask import Flask
+from flask import Flask, request
 import ccxt
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -11,29 +11,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()
 
-# --- Flask Setup (Render ke liye, background mein chalega) ---
 app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-@app.route('/health')
-def health():
-    return "OK"
-
-def run_flask():
-    # Render ka port
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-# --- Bot Setup ---
 TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
 PKT = timezone(timedelta(hours=5))
 
 exchange = ccxt.binanceusdm({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT']
+
+# Telegram App setup
+telegram_app = Application.builder().token(TOKEN).build()
 
 def calculate_indicators(df):
     delta = df['close'].diff()
@@ -95,21 +82,39 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Sorry, aap is bot ko use nahi kar sakte.")
 
+telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CommandHandler("scan", scan_command))
+
+# --- Webhook Routes ---
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook():
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        # Use asyncio to process update in background
+        asyncio.run_coroutine_threadsafe(telegram_app.process_update(update), telegram_app.loop)
+        return "OK", 200
+    return "Method Not Allowed", 405
+
+def set_webhook():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if url:
+        webhook_url = f"{url}/webhook/{TOKEN}"
+        print(f"Setting webhook to: {webhook_url}")
+        # Use requests to set webhook
+        import requests
+        response = requests.get(f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={webhook_url}")
+        print(response.json())
+
 if __name__ == "__main__":
-    print("Starting bot...")
+    port = int(os.environ.get("PORT", 10000))
     
-    # 1. Flask ko background thread mein chalayein
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+    # Initialize bot
+    telegram_app.initialize()
+    telegram_app.start()
     
-    # 2. Bot ko MAIN thread mein chalayein (Yeh error ko fix karega)
-    base_url = os.getenv("TELEGRAM_API_BASE", "https://flat-snow-1099.raza225pro.workers.dev")
-    telegram_app = Application.builder().token(TOKEN).base_url(base_url).build()
+    # Set webhook (agar Render URL available ho)
+    set_webhook()
     
-    telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("scan", scan_command))
-    
-    # Bot start
-    telegram_app.run_polling()
+    # Run Flask server
+    app.run(host="0.0.0.0", port=port)
