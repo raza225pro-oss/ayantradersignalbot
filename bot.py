@@ -1,6 +1,7 @@
 import os
 import ccxt
 import pandas as pd
+import asyncio
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Update
@@ -14,110 +15,111 @@ PKT = timezone(timedelta(hours=5))
 
 exchange = ccxt.binanceusdm({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
 
-# Zyada coins add kar diye hain taake market scan ho
-SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'DOT/USDT']
-
-def calculate_indicators(df):
-    # RSI
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    # EMA
-    df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
-    
-    # MACD
-    df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    
-    return df
+# Poore market ki jagah top 50+ major coins (taake API block na ho)
+SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 
+    'LINK/USDT', 'DOT/USDT', 'MATIC/USDT', 'LTC/USDT', 'BCH/USDT', 'UNI/USDT', 'ATOM/USDT', 
+    'ETC/USDT', 'FIL/USDT', 'APT/USDT', 'ARB/USDT', 'OP/USDT', 'SUI/USDT', 'NEAR/USDT', 
+    'INJ/USDT', 'TIA/USDT', 'SEI/USDT', 'RUNE/USDT', 'GALA/USDT', 'SAND/USDT', 'MANA/USDT',
+    'PEPE/USDT', 'SHIB/USDT', 'WIF/USDT', 'FLOKI/USDT', 'BONK/USDT', 'JUP/USDT', 'PYTH/USDT',
+    'ORDI/USDT', '1000SATS/USDT', 'FET/USDT', 'AGIX/USDT', 'RNDR/USDT', 'IMX/USDT', 'STX/USDT'
+]
 
 def get_signal(symbol):
     try:
-        # 5m timeframe taake jaldi aur zyada signals milein
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=50)
+        if not ohlcv: return None
+        
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = calculate_indicators(df)
+        
+        # Indicators
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
+        
         last, prev = df.iloc[-1], df.iloc[-2]
-        
-        direction = None
-        signal_strength = "Weak (Mild)"
-        reason = []
-        
-        # Up Trend Condition (Strong)
-        if prev['ema_fast'] <= prev['ema_slow'] and last['ema_fast'] > last['ema_slow'] and last['rsi'] < 70:
-            direction = "UPAR 📈"
-            signal_strength = "Strong"
-            reason.append("EMA Crossover (9 > 21)")
-            reason.append(f"RSI: {last['rsi']:.1f}")
-        
-        # Down Trend Condition (Strong)
-        elif prev['ema_fast'] >= prev['ema_slow'] and last['ema_fast'] < last['ema_slow'] and last['rsi'] > 30:
-            direction = "NEECHAY 📉"
-            signal_strength = "Strong"
-            reason.append("EMA Crossover (9 < 21)")
-            reason.append(f"RSI: {last['rsi']:.1f}")
-            
-        # Agar Strong nahi mila, toh MACD aur RSI se Weak/Mild signal dekhein
-        elif last['macd'] > last['macd_signal'] and last['rsi'] < 60 and last['rsi'] > 40:
-            if last['close'] > last['ema_fast']: # Price moving average ke upar hai
-                direction = "UPAR (Mild) 📈"
-                reason.append("MACD Bullish & Price > EMA9")
-                reason.append(f"RSI: {last['rsi']:.1f}")
-        elif last['macd'] < last['macd_signal'] and last['rsi'] > 40 and last['rsi'] < 60:
-            if last['close'] < last['ema_fast']: # Price moving average ke neeche hai
-                direction = "NEECHAY (Mild) 📉"
-                reason.append("MACD Bearish & Price < EMA9")
-                reason.append(f"RSI: {last['rsi']:.1f}")
+        direction, confidence, reason = None, 0, []
 
-        if direction:
+        # 1. UPAR ka Signal (60%+ confidence)
+        if last['ema_fast'] > last['ema_slow'] and last['close'] > last['ema_fast']:
+            confidence = 60
+            reason.append("EMA Uptrend")
+            if last['rsi'] > 50: 
+                confidence += 20
+                reason.append("RSI > 50")
+            if last['rsi'] > 70:
+                confidence -= 15 # Overbought risk
+            direction = "UPAR (LONG) 📈"
+
+        # 2. NEECHAY ka Signal (60%+ confidence)
+        elif last['ema_fast'] < last['ema_slow'] and last['close'] < last['ema_fast']:
+            confidence = 60
+            reason.append("EMA Downtrend")
+            if last['rsi'] < 50: 
+                confidence += 20
+                reason.append("RSI < 50")
+            if last['rsi'] < 30:
+                confidence -= 15 # Oversold risk
+            direction = "NEECHAY (SHORT) 📉"
+
+        # Agar confidence 60% ya us se zyada hai, toh signal return karein
+        if direction and confidence >= 60:
             now_pkt = datetime.now(PKT).strftime("%I:%M %p")
             return {
-                'symbol': symbol, 
-                'direction': direction, 
-                'strength': signal_strength,
-                'price': last['close'], 
-                'time_pkt': now_pkt, 
-                'reason': " | ".join(reason)
+                'symbol': symbol, 'direction': direction, 'confidence': confidence,
+                'price': last['close'], 'time_pkt': now_pkt, 'reason': " | ".join(reason)
             }
     except Exception as e:
-        print(f"Error scanning {symbol}: {e}")
+        pass # Error aane par agla coin check karein
     return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Assalam-o-Alaikum! Main aapka Market Signal Bot hoon.\n\nCommand: /scan")
+    await update.message.reply_text("Assalam-o-Alaikum! Main aapka Market Scanner Bot hoon.\n\nPoore market ko scan karne ke liye /scan likhein.")
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Market scan ho raha hai... (5m timeframe)")
+    msg = await update.message.reply_text("🔍 Poore market (40+ coins) ko scan kiya ja raha hai...\nThora intezar karein (is mein 1 minute lag sakta hai).")
+    
     found_signals = []
     
-    for s in SYMBOLS:
-        res = get_signal(s)
-        if res: 
+    # Har coin ko ek ek kar ke scan karein (Rate limit se bachne ke liye)
+    for sym in SYMBOLS:
+        res = get_signal(sym)
+        if res:
             found_signals.append(res)
+        await asyncio.sleep(0.2) # 0.2 seconds ka break taake Binance block na kare
+    
+    # Delete "Scanning..." message
+    await msg.delete()
     
     if not found_signals:
-        await update.message.reply_text("📊 Market bilkul flat hai. Abhi koi clear movement nahi hai. 5 minute baad try karein.")
+        await update.message.reply_text(f"📊 Poore market mein abhi 60%+ ka koi signal nahi hai.\nTime (PKT): {datetime.now(PKT).strftime('%I:%M %p')}")
     else:
-        for sig in found_signals:
-            msg = (
+        # Signals ko confidence ke hisaab se sort karein (Top wale pehle)
+        found_signals.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Top 5 best signals bhejein taake chat spam na ho
+        for sig in found_signals[:5]:
+            txt = (
                 f"🚨 **{sig['symbol']}**\n"
                 f"Direction: {sig['direction']}\n"
-                f"Strength: {sig['strength']}\n"
+                f"Confidence: {sig['confidence']}%\n"
                 f"Price: ${sig['price']:.4f}\n"
                 f"⏰ Time (PKT): {sig['time_pkt']}\n"
                 f"Reason: {sig['reason']}"
             )
-            await update.message.reply_text(msg, parse_mode='Markdown')
+            await update.message.reply_text(txt, parse_mode='Markdown')
+            await asyncio.sleep(0.5)
 
 async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Sorry, aap is bot ko use nahi kar sakte.")
 
 if __name__ == "__main__":
-    print("Starting upgraded bot...")
+    print("Starting Advanced Scanner Bot...")
     telegram_app = Application.builder().token(TOKEN).build()
     
     telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
