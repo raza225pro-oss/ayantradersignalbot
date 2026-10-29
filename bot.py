@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()
 
-# --- Flask Setup (Render ke liye) ---
+# --- Flask Setup (Render ke liye, background mein chalega) ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -21,6 +21,11 @@ def home():
 @app.route('/health')
 def health():
     return "OK"
+
+def run_flask():
+    # Render ka port
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # --- Bot Setup ---
 TOKEN = os.getenv("BOT_TOKEN")
@@ -90,28 +95,21 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Sorry, aap is bot ko use nahi kar sakte.")
 
-telegram_app = None
-
-def run_bot():
-    global telegram_app
-    print("Bot thread started...")
+if __name__ == "__main__":
+    print("Starting bot...")
     
-    # Yahan Cloudflare Proxy ka URL set kiya gaya hai
+    # 1. Flask ko background thread mein chalayein
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # 2. Bot ko MAIN thread mein chalayein (Yeh error ko fix karega)
     base_url = os.getenv("TELEGRAM_API_BASE", "https://flat-snow-1099.raza225pro.workers.dev")
-    
     telegram_app = Application.builder().token(TOKEN).base_url(base_url).build()
     
     telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
-    telegram_app.run_polling()
-
-if __name__ == "__main__":
-    # Bot ko background thread mein start karein
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
     
-    # Flask ko main thread mein chalayein (Render isi ko dhoondta hai)
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # Bot start
+    telegram_app.run_polling()
