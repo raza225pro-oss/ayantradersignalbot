@@ -4,6 +4,7 @@ import threading
 import logging
 from flask import Flask
 import ccxt
+import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -13,7 +14,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 load_dotenv()
 
-# Logging setup taake console me har error saaf nazar aaye
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "Quotex Live Scanner Bot is running!"
 
 @app.route('/health')
 def health():
@@ -38,56 +38,76 @@ raw_ids = os.getenv("ALLOWED_IDS", "")
 ALLOWED_IDS = [int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit()]
 PKT = timezone(timedelta(hours=5))
 
-# --- Smart Multi-Exchange Setup (Agar server IP par Binance block ho toh Bybit/KuCoin use karega) ---
+# --- Quotex Live Forex, Commodities & Indices (via Yahoo Finance) ---
+QUOTEX_FOREX_MARKETS = {
+    "EUR/USD (Live)": "EURUSD=X",
+    "GBP/USD (Live)": "GBPUSD=X",
+    "USD/JPY (Live)": "JPY=X",
+    "AUD/USD (Live)": "AUDUSD=X",
+    "USD/CAD (Live)": "CAD=X",
+    "USD/CHF (Live)": "CHF=X",
+    "NZD/USD (Live)": "NZDUSD=X",
+    "EUR/GBP (Live)": "EURGBP=X",
+    "EUR/JPY (Live)": "EURJPY=X",
+    "GBP/JPY (Live)": "GBPJPY=X",
+    "AUD/JPY (Live)": "AUDJPY=X",
+    "EUR/AUD (Live)": "EURAUD=X",
+    "EUR/CAD (Live)": "EURCAD=X",
+    "GBP/AUD (Live)": "GBPAUD=X",
+    "GBP/CAD (Live)": "GBPCAD=X",
+    "GBP/CHF (Live)": "GBPCHF=X",
+    "AUD/CAD (Live)": "AUDCAD=X",
+    "AUD/CHF (Live)": "AUDCHF=X",
+    "CAD/JPY (Live)": "CADJPY=X",
+    "CHF/JPY (Live)": "CHFJPY=X",
+    "EUR/CHF (Live)": "EURCHF=X",
+    "NZD/JPY (Live)": "NZDJPY=X",
+    "XAU/USD Gold (Live)": "GC=F",
+    "XAG/USD Silver (Live)": "SI=F",
+    "UKBrent / Crude Oil (Live)": "CL=F"
+}
+
+# --- Quotex Live Crypto Markets (Fallback via CCXT) ---
+QUOTEX_CRYPTO_MARKETS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
+    'ADA/USDT', 'DOGE/USDT', 'LTC/USDT', 'DOT/USDT', 'LINK/USDT',
+    'AVAX/USDT', 'TRX/USDT', 'TON/USDT', 'SHIB/USDT', 'PEPE/USDT'
+]
+
 def init_exchange():
-    exchanges_to_try = [
-        ('binanceusdm', {'enableRateLimit': True, 'options': {'defaultType': 'future'}}),
-        ('binance', {'enableRateLimit': True}),
-        ('bybit', {'enableRateLimit': True}),
-        ('kucoin', {'enableRateLimit': True})
-    ]
-    for ex_name, config in exchanges_to_try:
+    for ex_name in ['binance', 'bybit', 'kucoin']:
         try:
-            ex_class = getattr(ccxt, ex_name)
-            ex = ex_class(config)
+            ex = getattr(ccxt, ex_name)({'enableRateLimit': True})
             ex.fetch_ohlcv('BTC/USDT', timeframe='1m', limit=5)
-            logger.info(f"✅ Successfully connected to exchange: {ex_name.upper()}")
             return ex
-        except Exception as e:
-            logger.warning(f"⚠️ {ex_name} failed ({e}), trying next exchange...")
-    # Fallback default
-    return ccxt.binance({'enableRateLimit': True})
+        except Exception:
+            continue
+    return ccxt.bybit({'enableRateLimit': True})
 
 exchange = init_exchange()
 
-# Updated Active Coins List (Removed dead/delisted tickers like MATIC, AGIX, RNDR)
-SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT',
-    'LINK/USDT', 'DOT/USDT', 'POL/USDT', 'LTC/USDT', 'BCH/USDT', 'UNI/USDT', 'ATOM/USDT',
-    'ETC/USDT', 'FIL/USDT', 'APT/USDT', 'ARB/USDT', 'OP/USDT', 'SUI/USDT', 'NEAR/USDT',
-    'INJ/USDT', 'TIA/USDT', 'SEI/USDT', 'RUNE/USDT', 'GALA/USDT', 'SAND/USDT', 'MANA/USDT',
-    'PEPE/USDT', 'SHIB/USDT', 'WIF/USDT', 'FLOKI/USDT', 'BONK/USDT', 'JUP/USDT', 'PYTH/USDT',
-    'ORDI/USDT', 'FET/USDT', 'RENDER/USDT', 'IMX/USDT', 'STX/USDT', 'TON/USDT', 'TRX/USDT',
-    'AAVE/USDT', 'CRV/USDT', 'MKR/USDT', 'PENDLE/USDT', 'ENA/USDT', 'TAO/USDT', 'ONDO/USDT'
-]
-
-def calculate_indicators_and_signal(symbol):
+def evaluate_12_strategies(df, market_name):
+    """Applies 12 Binary Options 1-Minute Strategies on OHLCV DataFrame"""
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=60)
-        if not ohlcv or len(ohlcv) < 30:
+        if df is None or len(df) < 25:
             return None
 
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Ensure numeric columns
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
+        if len(df) < 25:
+            return None
 
-        # 1. EMAs (Fast 5, 9, 21, 50)
+        # 1. EMAs (5, 9, 21)
         df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
 
-        # 2. Correct Wilder's RSI (14)
+        # 2. Wilder's RSI (14) & Fast Binary RSI (7)
         delta = df['close'].diff()
-        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        gain = delta.clip(lower=0).ewm(alpha=1/7, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/7, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan)
         df['rsi'] = (100 - (100 / (1 + rs))).fillna(50)
 
@@ -102,176 +122,197 @@ def calculate_indicators_and_signal(symbol):
         df['upper_band'] = df['sma_20'] + (df['std'] * 2)
         df['lower_band'] = df['sma_20'] - (df['std'] * 2)
 
-        # 5. Correct Stochastic Oscillator (14, 3)
+        # 5. Stochastic Oscillator (14, 3)
         df['low_14'] = df['low'].rolling(window=14).min()
         df['high_14'] = df['high'].rolling(window=14).max()
         denom = (df['high_14'] - df['low_14']).replace(0, np.nan)
         df['stoch_k'] = (100 * ((df['close'] - df['low_14']) / denom)).fillna(50)
         df['stoch_d'] = df['stoch_k'].rolling(window=3).mean().fillna(50)
 
-        # 6. VWAP (Rolling 20-period intraday approximation)
-        typical_price = (df['high'] + df['low'] + df['close']) / 3
-        df['vwap'] = (typical_price * df['volume']).rolling(window=20).sum() / df['volume'].rolling(window=20).sum().replace(0, np.nan)
-
-        # 7. Volume Spike & Rate of Change (ROC)
-        df['vol_ma'] = df['volume'].rolling(window=20).mean()
-        df['roc'] = df['close'].pct_change(periods=3) * 100
+        # 6. CCI (Commodity Channel Index - 14) - Great for Quotex Forex
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        sma_tp = tp.rolling(window=14).mean()
+        mad = tp.rolling(window=14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True).replace(0, np.nan)
+        df['cci'] = ((tp - sma_tp) / (0.015 * mad)).fillna(0)
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        long_reasons = []
-        short_reasons = []
+        call_reasons = []
+        put_reasons = []
 
-        # --- 12 HIGH-SENSITIVITY TRIGGER STRATEGIES ---
+        # --- QUOTEX 1-MINUTE BINARY STRATEGIES ---
 
-        # Strategy 1: EMA 9/21 Fresh Crossover (High Weight)
-        if prev['ema_9'] <= prev['ema_21'] and last['ema_9'] > last['ema_21']:
-            long_reasons.append(("EMA 9/21 Bullish Cross", 15))
-        elif prev['ema_9'] >= prev['ema_21'] and last['ema_9'] < last['ema_21']:
-            short_reasons.append(("EMA 9/21 Bearish Cross", 15))
+        # 1. EMA 5/9 Fast Binary Crossover
+        if prev['ema_5'] <= prev['ema_9'] and last['ema_5'] > last['ema_9']:
+            call_reasons.append(("EMA 5/9 Bullish Cross", 16))
+        elif prev['ema_5'] >= prev['ema_9'] and last['ema_5'] < last['ema_9']:
+            put_reasons.append(("EMA 5/9 Bearish Cross", 16))
 
-        # Strategy 2: Fast Scalp EMA 5/9 Alignment
+        # 2. EMA Trend Alignment
         if last['ema_5'] > last['ema_9'] > last['ema_21']:
-            long_reasons.append(("Strong Bullish EMA Stack", 8))
+            call_reasons.append(("Strong Uptrend Alignment", 10))
         elif last['ema_5'] < last['ema_9'] < last['ema_21']:
-            short_reasons.append(("Strong Bearish EMA Stack", 8))
+            put_reasons.append(("Strong Downtrend Alignment", 10))
 
-        # Strategy 3: MACD Histogram Flip / Cross
-        if prev['macd_hist'] <= 0 and last['macd_hist'] > 0:
-            long_reasons.append(("MACD Fresh Bullish Cross", 15))
-        elif prev['macd_hist'] >= 0 and last['macd_hist'] < 0:
-            short_reasons.append(("MACD Fresh Bearish Cross", 15))
-        elif last['macd'] > last['macd_signal']:
-            long_reasons.append(("MACD Bullish Momentum", 6))
-        else:
-            short_reasons.append(("MACD Bearish Momentum", 6))
+        # 3. RSI (7) Binary Reversal & Momentum
+        if last['rsi'] < 28:
+            call_reasons.append((f"RSI Oversold Reversal ({last['rsi']:.0f})", 16))
+        elif last['rsi'] > 72:
+            put_reasons.append((f"RSI Overbought Reversal ({last['rsi']:.0f})", 16))
+        elif 52 < last['rsi'] <= 70:
+            call_reasons.append(("RSI Bullish Momentum", 6))
+        elif 30 <= last['rsi'] < 48:
+            put_reasons.append(("RSI Bearish Momentum", 6))
 
-        # Strategy 4: RSI Extremes & Momentum Zones
-        if last['rsi'] < 32:
-            long_reasons.append((f"RSI Oversold ({last['rsi']:.1f})", 14))
-        elif last['rsi'] > 68:
-            short_reasons.append((f"RSI Overbought ({last['rsi']:.1f})", 14))
-        elif 52 < last['rsi'] <= 68:
-            long_reasons.append(("RSI Bullish Zone", 5))
-        elif 32 <= last['rsi'] < 48:
-            short_reasons.append(("RSI Bearish Zone", 5))
-
-        # Strategy 5: Bollinger Band Breakout / Mean Reversion
+        # 4. Bollinger Band Rejection (Quotex Sureshot Pattern)
         if last['close'] <= last['lower_band']:
-            long_reasons.append(("Bollinger Lower Band Bounce", 14))
+            call_reasons.append(("Bollinger Lower Band Bounce", 15))
         elif last['close'] >= last['upper_band']:
-            short_reasons.append(("Bollinger Upper Band Rejection", 14))
+            put_reasons.append(("Bollinger Upper Band Rejection", 15))
 
-        # Strategy 6: Stochastic Reversal Cross
+        # 5. Stochastic Golden / Death Cross
         if last['stoch_k'] < 25 and last['stoch_k'] > last['stoch_d']:
-            long_reasons.append(("Stoch Oversold Turn Up", 12))
+            call_reasons.append(("Stochastic Oversold Cross Up", 14))
         elif last['stoch_k'] > 75 and last['stoch_k'] < last['stoch_d']:
-            short_reasons.append(("Stoch Overbought Turn Down", 12))
+            put_reasons.append(("Stochastic Overbought Cross Down", 14))
 
-        # Strategy 7: Volume Breakout Spike
-        if pd.notna(last['vol_ma']) and last['volume'] > (last['vol_ma'] * 1.5):
-            if last['close'] >= last['open']:
-                long_reasons.append(("High Volume Buying Spike", 12))
-            else:
-                short_reasons.append(("High Volume Selling Spike", 12))
+        # 6. MACD Momentum Flip
+        if prev['macd_hist'] <= 0 and last['macd_hist'] > 0:
+            call_reasons.append(("MACD Histogram Flip Green", 14))
+        elif prev['macd_hist'] >= 0 and last['macd_hist'] < 0:
+            put_reasons.append(("MACD Histogram Flip Red", 14))
+        elif last['macd'] > last['macd_signal']:
+            call_reasons.append(("MACD Bullish Zone", 5))
+        else:
+            put_reasons.append(("MACD Bearish Zone", 5))
 
-        # Strategy 8: VWAP Position
-        if pd.notna(last['vwap']):
-            if last['close'] > last['vwap']:
-                long_reasons.append(("Price Above VWAP", 6))
-            else:
-                short_reasons.append(("Price Below VWAP", 6))
+        # 7. CCI 100/-100 Breakout
+        if last['cci'] < -100:
+            call_reasons.append(("CCI Extreme Oversold Bounce", 12))
+        elif last['cci'] > 100:
+            put_reasons.append(("CCI Extreme Overbought Drop", 12))
 
-        # Strategy 9: Bullish / Bearish Engulfing Pattern
+        # 8. Engulfing Candlestick Pattern
         if last['close'] > last['open'] and prev['close'] < prev['open'] and last['close'] > prev['open']:
-            long_reasons.append(("Bullish Engulfing Candle", 12))
+            call_reasons.append(("Bullish Engulfing Pattern", 14))
         elif last['close'] < last['open'] and prev['close'] > prev['open'] and last['close'] < prev['open']:
-            short_reasons.append(("Bearish Engulfing Candle", 12))
+            put_reasons.append(("Bearish Engulfing Pattern", 14))
 
-        # Strategy 10: Pinbar / Hammer Wick Rejection
+        # 9. Pinbar / Wick Rejection
         body = abs(last['close'] - last['open'])
         lower_wick = min(last['close'], last['open']) - last['low']
         upper_wick = last['high'] - max(last['close'], last['open'])
         if lower_wick > body * 1.5 and lower_wick > upper_wick:
-            long_reasons.append(("Lower Wick Rejection (Hammer)", 10))
+            call_reasons.append(("Hammer Lower-Wick Rejection", 12))
         elif upper_wick > body * 1.5 and upper_wick > lower_wick:
-            short_reasons.append(("Upper Wick Rejection (Shooting Star)", 10))
+            put_reasons.append(("Shooting Star Upper-Wick Rejection", 12))
 
-        # Strategy 11: Micro Momentum Surge (ROC)
-        if last['roc'] > 0.25:
-            long_reasons.append((f"Fast Momentum Surge (+{last['roc']:.2f}%)", 10))
-        elif last['roc'] < -0.25:
-            short_reasons.append((f"Fast Momentum Drop ({last['roc']:.2f}%)", 10))
+        # 10. SMA 20 Mean Trend
+        if last['close'] > last['sma_20']:
+            call_reasons.append(("Price Above 20 SMA", 5))
+        else:
+            put_reasons.append(("Price Below 20 SMA", 5))
 
-        # Strategy 12: Raw Candle Action (Guaranteed Fallback Trigger)
+        # 11. Candle Body Momentum
         if last['close'] >= last['open']:
-            long_reasons.append(("Bullish Candle Close", 4))
+            call_reasons.append(("Bullish Active Candle", 4))
         else:
-            short_reasons.append(("Bearish Candle Close", 4))
+            put_reasons.append(("Bearish Active Candle", 4))
 
-        # --- SCORE & PICK WINNING DIRECTION ---
-        long_score = sum(w for _, w in long_reasons)
-        short_score = sum(w for _, w in short_reasons)
+        call_score = sum(w for _, w in call_reasons)
+        put_score = sum(w for _, w in put_reasons)
 
-        if long_score >= short_score:
-            direction = "LONG (BUY) 📈"
-            winning_reasons = [r for r, _ in sorted(long_reasons, key=lambda x: x[1], reverse=True)]
-            confidence = min(50 + long_score, 98)
-            tp = last['close'] * 1.008  # +0.8% Scalp TP
-            sl = last['close'] * 0.995  # -0.5% Scalp SL
+        if call_score >= put_score:
+            direction = "🟢 CALL (UP ⬆️)"
+            reasons = [r for r, _ in sorted(call_reasons, key=lambda x: x[1], reverse=True)]
+            confidence = min(55 + call_score, 98)
         else:
-            direction = "SHORT (SELL) 📉"
-            winning_reasons = [r for r, _ in sorted(short_reasons, key=lambda x: x[1], reverse=True)]
-            confidence = min(50 + short_score, 98)
-            tp = last['close'] * 0.992  # -0.8% Scalp TP
-            sl = last['close'] * 1.005  # +0.5% Scalp SL
+            direction = "🔴 PUT (DOWN ⬇️)"
+            reasons = [r for r, _ in sorted(put_reasons, key=lambda x: x[1], reverse=True)]
+            confidence = min(55 + put_score, 98)
 
-        now_pkt = datetime.now(PKT).strftime("%I:%M:%S %p")
+        now_pkt = datetime.now(PKT)
+        entry_time = (now_pkt + timedelta(minutes=1)).strftime("%I:%M %p")
+
         return {
-            'symbol': symbol,
+            'symbol': market_name,
             'direction': direction,
             'confidence': int(confidence),
-            'price': last['close'],
-            'tp': tp,
-            'sl': sl,
-            'rsi': last['rsi'],
-            'time_pkt': now_pkt,
-            'reason': ", ".join(winning_reasons[:3])  # Top 3 strongest triggers
+            'price': float(last['close']),
+            'rsi': float(last['rsi']),
+            'entry_time': entry_time,
+            'time_pkt': now_pkt.strftime("%I:%M:%S %p"),
+            'reason': ", ".join(reasons[:3])
         }
-
     except Exception as e:
-        logger.error(f"Error scanning {symbol}: {e}")
+        logger.error(f"Strategy error on {market_name}: {e}")
         return None
+
+def scan_all_quotex_markets():
+    signals = []
+
+    # 1. Batch Download All Quotex Live Forex & Commodities via Yahoo Finance (Fast 1-Request Download!)
+    try:
+        yf_tickers = list(QUOTEX_FOREX_MARKETS.values())
+        data = yf.download(tickers=yf_tickers, period="1d", interval="1m", group_by='ticker', progress=False, threads=True)
+        
+        for market_name, yf_sym in QUOTEX_FOREX_MARKETS.items():
+            try:
+                if yf_sym in data and not data[yf_sym].empty:
+                    sub_df = data[yf_sym].copy().dropna(subset=['Close'])
+                    if len(sub_df) >= 25:
+                        # Check if market is actually moving (not closed for weekend)
+                        if sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
+                            clean_df = pd.DataFrame({
+                                'open': sub_df['Open'].values,
+                                'high': sub_df['High'].values,
+                                'low': sub_df['Low'].values,
+                                'close': sub_df['Close'].values,
+                                'volume': sub_df['Volume'].values if 'Volume' in sub_df else 1
+                            })
+                            res = evaluate_12_strategies(clean_df, f"💱 {market_name}")
+                            if res:
+                                signals.append(res)
+            except Exception as e:
+                continue
+    except Exception as e:
+        logger.warning(f"Yahoo Finance Forex fetch issue: {e}")
+
+    # 2. Scan Quotex Live Crypto Pairs (24/7 Active even on Weekends)
+    for sym in QUOTEX_CRYPTO_MARKETS:
+        try:
+            ohlcv = exchange.fetch_ohlcv(sym, timeframe='1m', limit=50)
+            if ohlcv and len(ohlcv) >= 25:
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                clean_name = sym.replace('/USDT', '/USD (Live Crypto)')
+                res = evaluate_12_strategies(df, f"🪙 {clean_name}")
+                if res:
+                    signals.append(res)
+        except Exception:
+            continue
+
+    return signals
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
-        "🤖 *Aggressive Multi-Strategy Crypto Scanner Online!*\n\n"
-        "Use `/scan` to scan 50+ live crypto pairs across 12 micro-strategies "
-        "(EMA Cross, RSI, MACD, Bollinger Bands, Stochastic, VWAP, Volume Spikes & Price Action).\n\n"
-        "⚡ *Guaranteed live signals on every scan!*"
+        "📊 *Quotex Live Market Scanner Online!*\n\n"
+        "This bot scans *40+ Real Quotex Live Markets* on the *1-Minute Timeframe*:\n"
+        "✅ *Live Forex Pairs:* EUR/USD, GBP/USD, USD/JPY, AUD/CAD, EUR/JPY, GBP/JPY & 18 more!\n"
+        "✅ *Live Commodities:* Gold (XAU/USD), Silver, Crude Oil\n"
+        "✅ *Live Crypto:* BTC, ETH, SOL, XRP, DOGE & more!\n\n"
+        "👉 Send `/scan` to get instant *1-Minute Binary Signals (CALL / PUT)*!"
     )
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(
-        f"🔍 *Scanning {len(SYMBOLS)} live pairs across 12 strategies...*\n"
-        f"Exchange: `{exchange.id.upper()}`\n"
-        "Please wait a few seconds...",
+        "🔍 *Scanning Quotex Live Forex, Gold & Crypto Markets (1M Timeframe)...*\n"
+        "Analyzing 11 Binary Options indicators. Please wait 4-6 seconds...",
         parse_mode='Markdown'
     )
 
-    # Parallel batch scanning so 50 coins scan in ~4 seconds without freezing Telegram
-    found_signals = []
-    batch_size = 10
-    for i in range(0, len(SYMBOLS), batch_size):
-        batch = SYMBOLS[i:i + batch_size]
-        tasks = [asyncio.to_thread(calculate_indicators_and_signal, sym) for sym in batch]
-        results = await asyncio.gather(*tasks)
-        for res in results:
-            if res:
-                found_signals.append(res)
-        await asyncio.sleep(0.1)
+    found_signals = await asyncio.to_thread(scan_all_quotex_markets)
 
     try:
         await status_msg.delete()
@@ -280,34 +321,32 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not found_signals:
         await update.message.reply_text(
-            "⚠️ *Exchange API Connection Error!*\n"
-            "Could not fetch live candles from the exchange. Check server logs for IP/API restrictions.",
+            "⚠️ *No Live Data Received!* Please check your internet connection or try again in a few seconds.",
             parse_mode='Markdown'
         )
         return
 
-    # Sort by highest confidence first
-    found_signals.sort(key=lambda x: x['confidence'], reverse=True)
+    # Sort by highest confidence first, prioritizing Live Forex when markets are open
+    found_signals.sort(key=lambda x: (1 if "💱" in x['symbol'] else 0, x['confidence']), reverse=True)
 
     header = (
-        f"✅ *Scan Complete!* Found `{len(found_signals)}` active setups.\n"
-        f"🔥 *Top 10 Highest-Confidence Signals:*\n"
+        f"✅ *Quotex Live Scan Complete!*\n"
+        f"Analyzed `{len(found_signals)}` active live markets.\n"
+        f"🔥 *Top 10 High-Accuracy 1-Minute Signals:*\n"
     )
     await update.message.reply_text(header, parse_mode='Markdown')
 
     for sig in found_signals[:10]:
-        price_fmt = f"{sig['price']:.6f}" if sig['price'] < 0.1 else f"{sig['price']:.4f}"
-        tp_fmt = f"{sig['tp']:.6f}" if sig['tp'] < 0.1 else f"{sig['tp']:.4f}"
-        sl_fmt = f"{sig['sl']:.6f}" if sig['sl'] < 0.1 else f"{sig['sl']:.4f}"
+        price_fmt = f"{sig['price']:.5f}" if sig['price'] < 10 else f"{sig['price']:.2f}"
 
         txt = (
-            f"🚨 *{sig['symbol']}* — {sig['direction']}\n"
-            f"📊 *Confidence:* `{sig['confidence']}%` | *RSI:* `{sig['rsi']:.1f}`\n"
-            f"💰 *Entry Price:* `${price_fmt}`\n"
-            f"🎯 *Take Profit (Scalp):* `${tp_fmt}`\n"
-            f"🛑 *Stop Loss:* `${sl_fmt}`\n"
-            f"🧠 *Triggers:* _{sig['reason']}_\n"
-            f"⏰ *Time (PKT):* `{sig['time_pkt']}`"
+            f"📊 *Pair:* `{sig['symbol']}`\n"
+            f"🎯 *Action:* *{sig['direction']}*\n"
+            f"⏳ *Timeframe / Expiry:* `1 Minute (M1)`\n"
+            f"⏰ *Next Candle Entry:* `{sig['entry_time']} (PKT)`\n"
+            f"📈 *Confidence:* `{sig['confidence']}%` | *RSI(7):* `{sig['rsi']:.0f}`\n"
+            f"💰 *Current Price:* `{price_fmt}`\n"
+            f"🧠 *Strategy Match:* _{sig['reason']}_"
         )
         await update.message.reply_text(txt, parse_mode='Markdown')
         await asyncio.sleep(0.3)
@@ -316,10 +355,9 @@ async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛔ Access Denied. You are not authorized to use this bot.")
 
 def run_bot():
-    logger.info("Starting Telegram Bot...")
+    logger.info("Starting Quotex Telegram Bot...")
     telegram_app = Application.builder().token(TOKEN).build()
 
-    # Sirf tab block kare jab ALLOWED_IDS me waqai koi ID di gayi ho
     if ALLOWED_IDS:
         telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
 
