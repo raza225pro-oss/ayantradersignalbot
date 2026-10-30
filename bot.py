@@ -264,8 +264,8 @@ def evaluate_high_accuracy_strategies(df, market_name):
             confidence = min(60 + int(put_score * 0.75), 99)
 
         now_pkt = datetime.now(PKT)
-        # 24-hour format entry time just like the image (e.g., 03:28)
-        entry_time = (now_pkt + timedelta(minutes=1)).strftime("%H:%M")
+        # 12-hour format entry time (e.g., 03:28 PM)
+        entry_time = (now_pkt + timedelta(minutes=1)).strftime("%I:%M %p")
 
         return {
             'symbol': market_name,
@@ -381,6 +381,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚡ *TIMEFRAME :* `M1`\n"
             f"⏰ *ENTRY TIME :* `{sig['entry_time']}`\n"
             f"🔊 *DIRECTION :* *{sig['direction']}*\n"
+            f"⚠️ *1 STEP MTG MUST*\n"
             f"━━━━━━━━ 🆓 ━━━━━━━━\n\n"
             f"💮💮 *!SURESHOT SETUP!* 💮💮\n\n"
             f"📊 *ACCURACY :* `{sig['confidence']}%` 🟩\n"
