@@ -1,4 +1,6 @@
 import os
+import json
+import re
 import asyncio
 import threading
 import logging
@@ -20,6 +22,14 @@ from telegram.ext import (
     filters,
 )
 
+# Optional Telethon import for automatic @QuotexPartnerBot communication
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,13 +50,104 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-# --- Bot & Branding Setup ---
+# --- Configuration & Branding ---
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) if os.getenv("ADMIN_ID", "").strip().isdigit() else 0
 raw_ids = os.getenv("ALLOWED_IDS", "")
-ALLOWED_IDS = [int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit()]
-PKT = timezone(timedelta(hours=5))
+ENV_ALLOWED_IDS = set(int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit())
+if ADMIN_ID:
+    ENV_ALLOWED_IDS.add(ADMIN_ID)
 
+QUOTEX_PARTNER_LINK = os.getenv("QUOTEX_PARTNER_LINK", "https://broker-qx.pro/sign-up/?lid=2111446")
+EXPECTED_LINK_ID = os.getenv("EXPECTED_LINK_ID", "")  # e.g. "2111446" (Leave blank to accept any link id from your PartnerBot)
+BINANCE_PAY_ID = os.getenv("BINANCE_PAY_ID", "876543210 (Ayyan_Trader)")
+PREMIUM_PRICE = os.getenv("PREMIUM_PRICE", "$20 USDT (Lifetime Access)")
+PARTNER_BOT_USERNAME = os.getenv("PARTNER_BOT_USERNAME", "QuotexPartnerBot")
+
+TG_API_ID = os.getenv("TG_API_ID", "").strip()
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "").strip()
+
+PKT = timezone(timedelta(hours=5))
 SIGNAL_COUNT = 0
+DB_FILE = "authorized_users.json"
+
+# --- Persistent Database for Approved Users & Used Trader IDs ---
+def load_db():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"approved_users": [], "used_trader_ids": {}}
+
+def save_db(data):
+    try:
+        with open(DB_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Database save error: {e}")
+
+db_data = load_db()
+
+def is_user_authorized(user_id: int) -> bool:
+    if user_id in ENV_ALLOWED_IDS:
+        return True
+    if user_id in db_data.get("approved_users", []):
+        return True
+    return False
+
+def authorize_user(user_id: int, trader_id: str = None):
+    if user_id not in db_data["approved_users"]:
+        db_data["approved_users"].append(user_id)
+    if trader_id:
+        db_data["used_trader_ids"][str(trader_id)] = user_id
+    save_db(db_data)
+
+# --- Telethon Userbot Bridge for @QuotexPartnerBot ---
+telethon_client = None
+telethon_lock = asyncio.Lock()
+
+async def verify_with_quotex_partner_bot(trader_id: str):
+    """
+    Sends the Trader ID to @QuotexPartnerBot and parses the response:
+    - Found: Contains 'Trader #' and 'Country:' / 'Link Id:'
+    - Not Found: Contains 'was not found'
+    """
+    global telethon_client
+    if not TELETHON_AVAILABLE or not TG_API_ID or not TG_API_HASH:
+        return "MANUAL_FALLBACK", "Telethon API credentials not configured."
+
+    async with telethon_lock:
+        try:
+            if telethon_client is None:
+                session = StringSession(TG_SESSION_STRING) if TG_SESSION_STRING else "quotex_verifier"
+                telethon_client = TelegramClient(session, int(TG_API_ID), TG_API_HASH)
+            if not telethon_client.is_connected():
+                await telethon_client.connect()
+            if not await telethon_client.is_user_authorized():
+                return "MANUAL_FALLBACK", "Telethon user session not logged in yet."
+
+            async with telethon_client.conversation(PARTNER_BOT_USERNAME, timeout=15) as conv:
+                await conv.send_message(str(trader_id))
+                resp = await conv.get_response()
+                text = resp.text or ""
+
+                # Case 1: Trader ID Not Found
+                if "was not found" in text.lower() or "not found" in text.lower():
+                    return "NOT_FOUND", text
+
+                # Case 2: Trader Found
+                if f"trader # {trader_id}" in text.lower() or "trader #" in text.lower() or "registration date:" in text.lower():
+                    if EXPECTED_LINK_ID and f"link id: {EXPECTED_LINK_ID}" not in text.lower():
+                        return "WRONG_LINK", text
+                    return "FOUND", text
+
+                return "NOT_FOUND", text
+        except Exception as e:
+            logger.error(f"PartnerBot verification error: {e}")
+            return "ERROR", str(e)
 
 # --- STRICTLY VERIFIED QUOTEX LIVE MARKETS ---
 QUOTEX_LIVE_MARKETS = {
@@ -119,7 +220,6 @@ def init_exchange():
 
 exchange = init_exchange()
 
-# --- OTC Algorithmic Feed Generator (Synchronized Per Minute) ---
 def generate_otc_ohlcv(pair_name, seed_val, count=60):
     now_utc = datetime.now(timezone.utc)
     base_minute = int(now_utc.timestamp() // 60)
@@ -133,7 +233,6 @@ def generate_otc_ohlcv(pair_name, seed_val, count=60):
         val2 = (int(h[8:16], 16) / 0xFFFFFFFF)
         val3 = (int(h[16:24], 16) / 0xFFFFFFFF)
 
-        # Create realistic OTC wave + liquidity cycles
         wave = np.sin(i / 4.5 + (seed_val % 7)) * 0.18
         delta = (val1 * 0.45) + wave
         open_p = price
@@ -145,7 +244,6 @@ def generate_otc_ohlcv(pair_name, seed_val, count=60):
 
     return pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-# --- 18-Strategy High-Accuracy Engine ---
 def evaluate_high_accuracy_strategies(df, market_name):
     try:
         if df is None or len(df) < 35:
@@ -157,31 +255,26 @@ def evaluate_high_accuracy_strategies(df, market_name):
         if len(df) < 35:
             return None
 
-        # 1. EMAs (5, 9, 21, 50)
         df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
-        # 2. Fast Binary RSI (7)
         delta = df['close'].diff()
         gain7 = delta.clip(lower=0).ewm(alpha=1/7, adjust=False).mean()
         loss7 = (-delta.clip(upper=0)).ewm(alpha=1/7, adjust=False).mean()
         rs7 = gain7 / loss7.replace(0, np.nan)
         df['rsi'] = (100 - (100 / (1 + rs7))).fillna(50)
 
-        # 3. MACD (12, 26, 9)
         df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
         df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
         df['macd_hist'] = df['macd'] - df['macd_signal']
 
-        # 4. Bollinger Bands (20, 2)
         df['sma_20'] = df['close'].rolling(window=20).mean()
         df['std'] = df['close'].rolling(window=20).std()
         df['upper_band'] = df['sma_20'] + (df['std'] * 2)
         df['lower_band'] = df['sma_20'] - (df['std'] * 2)
 
-        # 5. Stochastic (14, 3) & Williams %R (14)
         df['low_14'] = df['low'].rolling(window=14).min()
         df['high_14'] = df['high'].rolling(window=14).max()
         denom = (df['high_14'] - df['low_14']).replace(0, np.nan)
@@ -189,13 +282,11 @@ def evaluate_high_accuracy_strategies(df, market_name):
         df['stoch_d'] = df['stoch_k'].rolling(window=3).mean().fillna(50)
         df['will_r'] = (-100 * ((df['high_14'] - df['close']) / denom)).fillna(-50)
 
-        # 6. CCI (14)
         tp = (df['high'] + df['low'] + df['close']) / 3
         sma_tp = tp.rolling(window=14).mean()
         mad = tp.rolling(window=14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True).replace(0, np.nan)
         df['cci'] = ((tp - sma_tp) / (0.015 * mad)).fillna(0)
 
-        # 7. ATR (14) & ADX (14)
         tr1 = df['high'] - df['low']
         tr2 = (df['high'] - df['close'].shift(1)).abs()
         tr3 = (df['low'] - df['close'].shift(1)).abs()
@@ -211,7 +302,6 @@ def evaluate_high_accuracy_strategies(df, market_name):
         dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
         df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(20)
 
-        # 8. Dynamic Support & Resistance (15-Period Fractals)
         df['support'] = df['low'].rolling(window=15).min()
         df['resistance'] = df['high'].rolling(window=15).max()
 
@@ -224,19 +314,16 @@ def evaluate_high_accuracy_strategies(df, market_name):
 
         atr_val = float(live['atr']) if live['atr'] > 0 else 0.0001
 
-        # 1. Support & Resistance Zone Bounce
         if abs(live['low'] - live['support']) <= (atr_val * 0.45) and live['close'] >= live['open']:
             call_reasons.append(("Support Zone Rejection", 20))
         elif abs(live['high'] - live['resistance']) <= (atr_val * 0.45) and live['close'] <= live['open']:
             put_reasons.append(("Resistance Zone Rejection", 20))
 
-        # 2. EMA 5/9 Crossover
         if prev['ema_5'] <= prev['ema_9'] and (closed['ema_5'] > closed['ema_9'] or live['ema_5'] > live['ema_9']):
             call_reasons.append(("EMA 5/9 Bullish Cross", 18))
         elif prev['ema_5'] >= prev['ema_9'] and (closed['ema_5'] < closed['ema_9'] or live['ema_5'] < live['ema_9']):
             put_reasons.append(("EMA 5/9 Bearish Cross", 18))
 
-        # 3. M1 + M5 Trend Alignment
         if live['ema_5'] > live['ema_9'] > live['ema_21'] > live['ema_50']:
             call_reasons.append(("M1 + M5 Strong Uptrend", 16))
         elif live['ema_5'] < live['ema_9'] < live['ema_21'] < live['ema_50']:
@@ -246,7 +333,6 @@ def evaluate_high_accuracy_strategies(df, market_name):
         else:
             put_reasons.append(("EMA Trend Bearish", 8))
 
-        # 4. RSI (7) Sureshot Reversal & Momentum
         if closed['rsi'] < 28 or live['rsi'] < 25:
             call_reasons.append((f"RSI Oversold Reversal ({live['rsi']:.0f})", 18))
         elif closed['rsi'] > 72 or live['rsi'] > 75:
@@ -256,19 +342,16 @@ def evaluate_high_accuracy_strategies(df, market_name):
         elif 32 <= live['rsi'] <= 48 and live['rsi'] < closed['rsi']:
             put_reasons.append(("RSI Bearish Momentum", 9))
 
-        # 5. Bollinger Band Bounce
         if closed['low'] <= closed['lower_band'] or live['close'] <= live['lower_band']:
             call_reasons.append(("Bollinger Lower Band Bounce", 17))
         elif closed['high'] >= closed['upper_band'] or live['close'] >= live['upper_band']:
             put_reasons.append(("Bollinger Upper Band Rejection", 17))
 
-        # 6. Stochastic + Williams %R Confluence
         if live['stoch_k'] < 25 and live['stoch_k'] >= live['stoch_d'] and live['will_r'] < -75:
             call_reasons.append(("Stoch + Will%R Oversold", 16))
         elif live['stoch_k'] > 75 and live['stoch_k'] <= live['stoch_d'] and live['will_r'] > -25:
             put_reasons.append(("Stoch + Will%R Overbought", 16))
 
-        # 7. MACD Flip & Surge
         if prev['macd_hist'] <= 0 and live['macd_hist'] > 0:
             call_reasons.append(("MACD Flip Green", 15))
         elif prev['macd_hist'] >= 0 and live['macd_hist'] < 0:
@@ -278,19 +361,16 @@ def evaluate_high_accuracy_strategies(df, market_name):
         elif live['macd_hist'] < closed['macd_hist'] and live['macd_hist'] < 0:
             put_reasons.append(("MACD Bearish Surge", 8))
 
-        # 8. CCI Reversal Hook
         if live['cci'] < -100:
             call_reasons.append(("CCI Oversold Bounce", 13))
         elif live['cci'] > 100:
             put_reasons.append(("CCI Overbought Drop", 13))
 
-        # 9. Engulfing Candlestick
         if closed['close'] > closed['open'] and prev['close'] < prev['open'] and closed['close'] > prev['open']:
             call_reasons.append(("Bullish Engulfing Pattern", 15))
         elif closed['close'] < closed['open'] and prev['close'] > prev['open'] and closed['close'] < prev['open']:
             put_reasons.append(("Bearish Engulfing Pattern", 15))
 
-        # 10. Pinbar / Wick Rejection
         body = abs(closed['close'] - closed['open'])
         lower_wick = min(closed['close'], closed['open']) - closed['low']
         upper_wick = closed['high'] - max(closed['close'], closed['open'])
@@ -299,7 +379,6 @@ def evaluate_high_accuracy_strategies(df, market_name):
         elif upper_wick > body * 1.5 and upper_wick > lower_wick:
             put_reasons.append(("Shooting Star Wick Rejection", 14))
 
-        # 11. Candle Exhaustion Filter
         closed_size = abs(closed['close'] - closed['open'])
         if closed_size > (atr_val * 2.2):
             if closed['close'] > closed['open']:
@@ -307,7 +386,6 @@ def evaluate_high_accuracy_strategies(df, market_name):
             else:
                 call_reasons.append(("Exhaustion Drop Pullback", 14))
 
-        # 12. ADX Trend Power & Live Pressure
         if live['adx'] >= 23:
             if live['ema_5'] > live['ema_21']:
                 call_reasons.append((f"Strong ADX Trend ({live['adx']:.0f})", 9))
@@ -349,7 +427,6 @@ def evaluate_high_accuracy_strategies(df, market_name):
         logger.error(f"Strategy error on {market_name}: {e}")
         return None
 
-# --- Data Fetchers ---
 def fetch_single_pair_signal(pair_name, is_otc=False):
     if is_otc:
         info = QUOTEX_OTC_MARKETS.get(pair_name)
@@ -368,7 +445,6 @@ def fetch_single_pair_signal(pair_name, is_otc=False):
                     if isinstance(data.columns, pd.MultiIndex):
                         data.columns = data.columns.get_level_values(0)
                     sub_df = data.dropna(subset=['Close'])
-                    # Check if live forex is open and moving
                     if len(sub_df) >= 35 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
                         clean_df = pd.DataFrame({
                             'open': sub_df['Open'].values,
@@ -400,7 +476,6 @@ def scan_best_signals(mode="live", count=1):
             if res:
                 signals.append(res)
     else:
-        # Batch Forex Live
         try:
             fx_pairs = {k: v['ticker'] for k, v in QUOTEX_LIVE_MARKETS.items() if v['type'] == 'forex'}
             yf_tickers = list(fx_pairs.values())
@@ -426,7 +501,6 @@ def scan_best_signals(mode="live", count=1):
         except Exception as e:
             logger.warning(f"Batch Yahoo Finance error: {e}")
 
-        # Crypto Live
         for pair_name, info in QUOTEX_LIVE_MARKETS.items():
             if info['type'] == 'crypto':
                 try:
@@ -451,7 +525,37 @@ def scan_best_signals(mode="live", count=1):
     )
     return signals[:count]
 
-# --- UI Keyboards (Matching Screenshot Style) ---
+# --- Keyboards for Unverified Users (Free Registration & Premium Gate) ---
+def get_access_gate_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆓 GET FREE ACCESS (VIP)", callback_data="gate_free")],
+        [InlineKeyboardButton("💎 BUY PREMIUM ACCESS", callback_data="gate_premium")],
+        [
+            InlineKeyboardButton("📢 JOIN VIP GROUP", url="https://t.me/ayyan_trader02"),
+            InlineKeyboardButton("🎫 CONTACT ADMIN", url="https://t.me/Ayyan_trader01")
+        ]
+    ])
+
+def get_free_access_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 CREATE QUOTEX ACCOUNT NOW", url=QUOTEX_PARTNER_LINK)],
+        [InlineKeyboardButton("✍️ SUBMIT MY TRADER ID", callback_data="enter_trader_id")],
+        [
+            InlineKeyboardButton("🎫 Contact Admin", url="https://t.me/Ayyan_trader01"),
+            InlineKeyboardButton("⬅️ Back", callback_data="gate_home")
+        ]
+    ])
+
+def get_premium_access_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📸 SEND PAYMENT SCREENSHOT TO ADMIN", url="https://t.me/Ayyan_trader01")],
+        [
+            InlineKeyboardButton("🆓 Get Free Access Instead", callback_data="gate_free"),
+            InlineKeyboardButton("⬅️ Back", callback_data="gate_home")
+        ]
+    ])
+
+# --- Keyboards for Verified VIP Users ---
 def get_main_dashboard_kb():
     return InlineKeyboardMarkup([
         [
@@ -545,7 +649,6 @@ def format_signal_card(sig):
         f"📢 *GROUP :* [Join VIP Group](https://t.me/ayyan_trader02)"
     )
 
-# --- Live Scanning Animation Helper ---
 async def play_scan_animation(msg, target_label):
     stages = [
         f"⚡ *INITIALIZING AYYAN GenAI+ ENGINE...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🔄 `Connecting to Quotex Liquidity Feed...`\n`[███▒▒▒▒▒▒▒] 35%`",
@@ -559,38 +662,313 @@ async def play_scan_animation(msg, target_label):
         except Exception:
             pass
 
-# --- Bot Handlers ---
+# --- Text Templates ---
+GATE_HOME_TEXT = (
+    "👾 *WELCOME TO AYYAN GenAI+ QUOTEX BOT* 👾\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "🔒 *VIP ACCESS REQUIRED*\n"
+    "You currently do not have active access to the Quotex M1 Signal Terminal. Choose one of the options below to unlock instant *LIVE & OTC Signals*:\n\n"
+    "🆓 *Option 1 : Get Free Access*\n"
+    "Register a Quotex account through our official partner link and send your *Trader ID* for instant automated verification.\n\n"
+    "💎 *Option 2 : Buy Premium Access*\n"
+    "Pay via *Binance Pay* without creating a new Quotex account and get instant lifetime access.\n\n"
+    "🔖 *ADMIN :* @Ayyan\\_trader01 🌸"
+)
+
 DASHBOARD_TEXT = (
     "👾 *AYYAN GenAI+ QUOTEX DASHBOARD* 👾\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "ℹ️ *Welcome to the Official Quotex M1 Signal Terminal.*\n"
+    "✅ *VIP STATUS : ACTIVE*\n"
     "Select your trading market below to generate institutional-grade *LIVE* or *OTC* signals with real-time indicator confluence.\n\n"
     "💠 *Engine :* `18 Indicators + Fractal S&R + ADX`\n"
     "🔥 *Markets :* `100% Verified Quotex Live & OTC` · `UTC+5`\n\n"
     "🔖 *TELEGRAM :* @Ayyan\\_trader01 🌸"
 )
 
+# --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        DASHBOARD_TEXT,
-        parse_mode='Markdown',
-        reply_markup=get_main_dashboard_kb(),
-        disable_web_page_preview=True
-    )
+    user_id = update.effective_user.id
+    context.user_data["awaiting_trader_id"] = False
+
+    if is_user_authorized(user_id):
+        await update.message.reply_text(
+            DASHBOARD_TEXT,
+            parse_mode='Markdown',
+            reply_markup=get_main_dashboard_kb(),
+            disable_web_page_preview=True
+        )
+    else:
+        await update.message.reply_text(
+            GATE_HOME_TEXT,
+            parse_mode='Markdown',
+            reply_markup=get_access_gate_kb(),
+            disable_web_page_preview=True
+        )
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        DASHBOARD_TEXT,
-        parse_mode='Markdown',
-        reply_markup=get_main_dashboard_kb(),
-        disable_web_page_preview=True
+    await start(update, context)
+
+# Admin command to manually add paid users anytime: /adduser 123456789
+async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ENV_ALLOWED_IDS and user_id != ADMIN_ID:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("⚠️ *Usage:* `/adduser <Telegram_User_ID>`", parse_mode='Markdown')
+        return
+
+    new_uid = int(context.args[0])
+    authorize_user(new_uid)
+    await update.message.reply_text(f"✅ *User `{new_uid}` has been granted VIP Premium Access!*", parse_mode='Markdown')
+    try:
+        await context.bot.send_message(
+            chat_id=new_uid,
+            text="🎉 *CONGRATULATIONS!*\n━━━━━━━━━━━━━━━━━━━━━━\n💎 Your *VIP Premium Access* has been activated by Admin!\n\n👉 Send `/start` to open the Signal Terminal.",
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+
+# --- Trader ID Input Handler (When Unverified User Pastes ID) ---
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # Extract 6 to 12 digit Quotex Trader ID if user sends numbers
+    match = re.search(r'\b(\d{6,12})\b', text)
+
+    if is_user_authorized(user_id) and not context.user_data.get("awaiting_trader_id"):
+        await update.message.reply_text(
+            DASHBOARD_TEXT,
+            parse_mode='Markdown',
+            reply_markup=get_main_dashboard_kb(),
+            disable_web_page_preview=True
+        )
+        return
+
+    if not match:
+        await update.message.reply_text(
+            "⚠️ *INVALID TRADER ID FORMAT*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "ℹ️ Please send only your numeric *Quotex Trader ID* (for example: `95420333`).\n\n"
+            "Don't have an account yet? Tap the button below to register first:",
+            parse_mode='Markdown',
+            reply_markup=get_free_access_kb()
+        )
+        return
+
+    trader_id = match.group(1)
+
+    # Check if this Trader ID is already used by another Telegram user
+    used_by = db_data.get("used_trader_ids", {}).get(trader_id)
+    if used_by and used_by != user_id:
+        await update.message.reply_text(
+            "⛔ *TRADER ID ALREADY REGISTERED*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"ℹ️ Trader ID `{trader_id}` is already linked to another Telegram account. Each user must create their own personal Quotex account.",
+            parse_mode='Markdown',
+            reply_markup=get_free_access_kb()
+        )
+        return
+
+    verify_msg = await update.message.reply_text(
+        f"🔄 *VERIFYING TRADER ID `{trader_id}`...*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 `Checking registration with @QuotexPartnerBot...`\n"
+        f"`[█████▒▒▒▒▒] 50%`",
+        parse_mode='Markdown'
     )
 
+    status, raw_reply = await verify_with_quotex_partner_bot(trader_id)
+
+    if status == "FOUND":
+        authorize_user(user_id, trader_id)
+        context.user_data["awaiting_trader_id"] = False
+        await verify_msg.edit_text(
+            f"✅ *TRADER ID VERIFIED SUCCESSFULLY!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 *Trader ID :* `#{trader_id}`\n"
+            f"🟢 *Status :* `VIP Access Unlocked`\n\n"
+            f"Welcome to *Ayyan GenAI+ Quotex Terminal*! Select your market below to start trading:",
+            parse_mode='Markdown',
+            reply_markup=get_main_dashboard_kb()
+        )
+        return
+
+    elif status in ["NOT_FOUND", "WRONG_LINK"]:
+        await verify_msg.edit_text(
+            f"❌ *ACCOUNT NOT FOUND!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"ℹ️ `Trader with ID = '{trader_id}' was not found.`\n\n"
+            f"You have not created a Quotex account using our official partner link yet. Please follow these steps:\n"
+            f"1️⃣ Click *CREATE QUOTEX ACCOUNT NOW* below.\n"
+            f"2️⃣ Register a fresh account with a new email.\n"
+            f"3️⃣ Copy your 8-9 digit *Trader ID* and paste it here again!",
+            parse_mode='Markdown',
+            reply_markup=get_free_access_kb()
+        )
+        return
+
+    else:
+        # Fallback if Telethon session isn't logged in yet: Send 1-Click Approval to Admin
+        if ADMIN_ID:
+            admin_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve User", callback_data=f"adm_app_{user_id}_{trader_id}"),
+                    InlineKeyboardButton("❌ Reject (Not Found)", callback_data=f"adm_rej_{user_id}_{trader_id}")
+                ]
+            ])
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"🔔 *NEW TRADER ID VERIFICATION REQUEST*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 *User:* {update.effective_user.mention_markdown()} (`{user_id}`)\n"
+                        f"🆔 *Quotex Trader ID:* `{trader_id}`\n\n"
+                        f"Check `{trader_id}` in @QuotexPartnerBot and click below:"
+                    ),
+                    parse_mode='Markdown',
+                    reply_markup=admin_kb
+                )
+            except Exception as e:
+                logger.error(f"Admin notify error: {e}")
+
+        await verify_msg.edit_text(
+            f"⏳ *TRADER ID `{trader_id}` SUBMITTED FOR VERIFICATION*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"ℹ️ Your Trader ID has been sent to our verification system. You will receive an automatic notification here as soon as your ID is verified!",
+            parse_mode='Markdown',
+            reply_markup=get_access_gate_kb()
+        )
+
+# --- Callback Button Handler ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
 
+    # --- Admin 1-Click Approval Callbacks ---
+    if data.startswith("adm_app_") or data.startswith("adm_rej_"):
+        if user_id not in ENV_ALLOWED_IDS and user_id != ADMIN_ID:
+            return
+        parts = data.split("_")
+        action = parts[1]
+        target_uid = int(parts[2])
+        t_id = parts[3]
+
+        if action == "app":
+            authorize_user(target_uid, t_id)
+            await query.edit_message_text(f"✅ *Approved User `{target_uid}` (Trader ID: `{t_id}`)*", parse_mode='Markdown')
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text=(
+                        f"✅ *TRADER ID `#{t_id}` VERIFIED!*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎉 Your *VIP Access* is now active! Choose your trading market below:"
+                    ),
+                    parse_mode='Markdown',
+                    reply_markup=get_main_dashboard_kb()
+                )
+            except Exception:
+                pass
+        else:
+            await query.edit_message_text(f"❌ *Rejected User `{target_uid}` (Trader ID `{t_id}` Not Found)*", parse_mode='Markdown')
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text=(
+                        f"❌ *ACCOUNT NOT FOUND!*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"ℹ️ `Trader with ID = '{t_id}' was not found.`\n\n"
+                        f"You have not created an account using our official partner link yet. Please click the button below to register a new Quotex account and submit your new Trader ID:"
+                    ),
+                    parse_mode='Markdown',
+                    reply_markup=get_free_access_kb()
+                )
+            except Exception:
+                pass
+        return
+
+    # --- Access Gate Callbacks (Available to Unverified Users) ---
+    if data == "gate_home":
+        context.user_data["awaiting_trader_id"] = False
+        await query.edit_message_text(
+            GATE_HOME_TEXT,
+            parse_mode='Markdown',
+            reply_markup=get_access_gate_kb(),
+            disable_web_page_preview=True
+        )
+        return
+
+    if data == "gate_free":
+        context.user_data["awaiting_trader_id"] = True
+        free_text = (
+            "🆓 *GET FREE VIP BOT ACCESS*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Follow these 3 simple steps to unlock the bot for *FREE*:\n\n"
+            "1️⃣ Click *CREATE QUOTEX ACCOUNT NOW* below and register a new Quotex account via our official link.\n"
+            "2️⃣ Open your Quotex Profile and copy your *8 or 9 digit Trader ID* (e.g., `95420333`).\n"
+            "3️⃣ Paste and send your *Trader ID* directly in this chat!\n\n"
+            "⚠️ _Note: Only accounts registered through our link will be approved by @QuotexPartnerBot._\n\n"
+            "👇 *Send your numeric Trader ID in the message box below:*"
+        )
+        await query.edit_message_text(
+            free_text,
+            parse_mode='Markdown',
+            reply_markup=get_free_access_kb(),
+            disable_web_page_preview=True
+        )
+        return
+
+    if data == "enter_trader_id":
+        context.user_data["awaiting_trader_id"] = True
+        await query.edit_message_text(
+            "✍️ *SUBMIT YOUR QUOTEX TRADER ID*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Please type and send your numeric *Quotex Trader ID* (e.g. `95420333`) in this chat right now.\n\n"
+            "🔄 _Our system will automatically verify your ID with @QuotexPartnerBot in 2 seconds!_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="gate_free")]])
+        )
+        return
+
+    if data == "gate_premium":
+        context.user_data["awaiting_trader_id"] = False
+        prem_text = (
+            "💎 *BUY VIP PREMIUM ACCESS (NO LINK NEEDED)*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Don't want to create a new Quotex account? Unlock lifetime VIP bot access via *Binance Pay*:\n\n"
+            f"💰 *Price :* `{PREMIUM_PRICE}`\n"
+            f"🏦 *Binance Pay ID :* `{BINANCE_PAY_ID}`\n"
+            f"🆔 *Your Telegram ID :* `{user_id}`\n\n"
+            "📌 *How to Activate:*\n"
+            "1️⃣ Send the payment to the Binance Pay ID above.\n"
+            "2️⃣ Take a screenshot of the payment confirmation.\n"
+            f"3️⃣ Send the screenshot along with your Telegram ID (`{user_id}`) to @Ayyan\\_trader01 for instant activation!"
+        )
+        await query.edit_message_text(
+            prem_text,
+            parse_mode='Markdown',
+            reply_markup=get_premium_access_kb(),
+            disable_web_page_preview=True
+        )
+        return
+
+    # --- Block Signal Terminal Buttons if User is Not Verified ---
+    if not is_user_authorized(user_id):
+        await query.edit_message_text(
+            GATE_HOME_TEXT,
+            parse_mode='Markdown',
+            reply_markup=get_access_gate_kb(),
+            disable_web_page_preview=True
+        )
+        return
+
+    # --- Verified VIP Terminal Navigation ---
     if data in ["main_menu", "menu_modes"]:
         await query.edit_message_text(
             DASHBOARD_TEXT,
@@ -707,23 +1085,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎫 CONTACT OWNER", url="https://t.me/Ayyan_trader01")]])
-    if update.message:
-        await update.message.reply_text("⛔ *ACCESS DENIED*\n━━━━━━━━━━━━━━━━━━━━━━\nℹ️ You are not authorized to use this terminal.", parse_mode='Markdown', reply_markup=kb)
-    elif update.callback_query:
-        await update.callback_query.answer("⛔ Access Denied! Contact @Ayyan_trader01", show_alert=True)
-
 def run_bot():
     logger.info("Starting Ayyan GenAI+ Quotex Telegram Bot...")
     telegram_app = Application.builder().token(TOKEN).build()
 
-    if ALLOWED_IDS:
-        telegram_app.add_handler(MessageHandler(~filters.User(ALLOWED_IDS), unauthorized))
-
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
+    telegram_app.add_handler(CommandHandler("adduser", adduser_command))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     telegram_app.run_polling(drop_pending_updates=True)
 
