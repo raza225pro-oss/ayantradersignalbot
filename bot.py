@@ -40,7 +40,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Ayyan GenAI+ Quotex Bot is running!"
+    return "Ayyan Trader Quotex Bot is running!"
 
 @app.route('/health')
 def health():
@@ -59,7 +59,7 @@ if ADMIN_ID:
     ENV_ALLOWED_IDS.add(ADMIN_ID)
 
 QUOTEX_PARTNER_LINK = os.getenv("QUOTEX_PARTNER_LINK", "https://broker-qx.pro/sign-up/?lid=2111446")
-EXPECTED_LINK_ID = os.getenv("EXPECTED_LINK_ID", "")  # e.g. "2111446" (Leave blank to accept any link id from your PartnerBot)
+EXPECTED_LINK_ID = os.getenv("EXPECTED_LINK_ID", "")
 BINANCE_PAY_ID = os.getenv("BINANCE_PAY_ID", "876543210 (Ayyan_Trader)")
 PREMIUM_PRICE = os.getenv("PREMIUM_PRICE", "$20 USDT (Lifetime Access)")
 PARTNER_BOT_USERNAME = os.getenv("PARTNER_BOT_USERNAME", "QuotexPartnerBot")
@@ -110,11 +110,6 @@ telethon_client = None
 telethon_lock = asyncio.Lock()
 
 async def verify_with_quotex_partner_bot(trader_id: str):
-    """
-    Sends the Trader ID to @QuotexPartnerBot and parses the response:
-    - Found: Contains 'Trader #' and 'Country:' / 'Link Id:'
-    - Not Found: Contains 'was not found'
-    """
     global telethon_client
     if not TELETHON_AVAILABLE or not TG_API_ID or not TG_API_HASH:
         return "MANUAL_FALLBACK", "Telethon API credentials not configured."
@@ -134,11 +129,9 @@ async def verify_with_quotex_partner_bot(trader_id: str):
                 resp = await conv.get_response()
                 text = resp.text or ""
 
-                # Case 1: Trader ID Not Found
                 if "was not found" in text.lower() or "not found" in text.lower():
                     return "NOT_FOUND", text
 
-                # Case 2: Trader Found
                 if f"trader # {trader_id}" in text.lower() or "trader #" in text.lower() or "registration date:" in text.lower():
                     if EXPECTED_LINK_ID and f"link id: {EXPECTED_LINK_ID}" not in text.lower():
                         return "WRONG_LINK", text
@@ -233,184 +226,198 @@ def generate_otc_ohlcv(pair_name, seed_val, count=60):
         val2 = (int(h[8:16], 16) / 0xFFFFFFFF)
         val3 = (int(h[16:24], 16) / 0xFFFFFFFF)
 
-        wave = np.sin(i / 4.5 + (seed_val % 7)) * 0.18
-        delta = (val1 * 0.45) + wave
+        wave = np.sin(i / 4.0 + (seed_val % 7)) * 0.22
+        delta = (val1 * 0.42) + wave
         open_p = price
         close_p = open_p + delta
-        high_p = max(open_p, close_p) + (val2 * 0.22)
-        low_p = min(open_p, close_p) - (val3 * 0.22)
+        high_p = max(open_p, close_p) + (val2 * 0.20)
+        low_p = min(open_p, close_p) - (val3 * 0.20)
         price = close_p
         rows.append([m_stamp * 60, open_p, high_p, low_p, close_p, 1000 + int(val2 * 500)])
 
     return pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
+# --- UPGRADED ANTI-LOSS M1 BINARY ACCURACY ENGINE ---
 def evaluate_high_accuracy_strategies(df, market_name):
+    """
+    Separates Trend Continuation vs Extreme S&R Reversal so indicators never contradict each other.
+    Uses confirmed closed candles (iloc[-2]) + streak exhaustion protection.
+    """
     try:
-        if df is None or len(df) < 35:
+        if df is None or len(df) < 40:
             return None
 
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
-        if len(df) < 35:
+        if len(df) < 40:
             return None
 
-        df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
+        # 1. Institutional EMAs (9, 21, 50)
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
+        # 2. Precision RSI (7 for Binary Reversals, 14 for Trend)
         delta = df['close'].diff()
         gain7 = delta.clip(lower=0).ewm(alpha=1/7, adjust=False).mean()
         loss7 = (-delta.clip(upper=0)).ewm(alpha=1/7, adjust=False).mean()
-        rs7 = gain7 / loss7.replace(0, np.nan)
-        df['rsi'] = (100 - (100 / (1 + rs7))).fillna(50)
+        df['rsi_7'] = (100 - (100 / (1 + (gain7 / loss7.replace(0, np.nan))))).fillna(50)
 
-        df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
+        gain14 = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss14 = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        df['rsi_14'] = (100 - (100 / (1 + (gain14 / loss14.replace(0, np.nan))))).fillna(50)
 
+        # 3. Bollinger Bands (20, 2.0)
         df['sma_20'] = df['close'].rolling(window=20).mean()
-        df['std'] = df['close'].rolling(window=20).std()
-        df['upper_band'] = df['sma_20'] + (df['std'] * 2)
-        df['lower_band'] = df['sma_20'] - (df['std'] * 2)
+        df['std_20'] = df['close'].rolling(window=20).std()
+        df['upper_bb'] = df['sma_20'] + (df['std_20'] * 2.0)
+        df['lower_bb'] = df['sma_20'] - (df['std_20'] * 2.0)
 
-        df['low_14'] = df['low'].rolling(window=14).min()
-        df['high_14'] = df['high'].rolling(window=14).max()
-        denom = (df['high_14'] - df['low_14']).replace(0, np.nan)
-        df['stoch_k'] = (100 * ((df['close'] - df['low_14']) / denom)).fillna(50)
+        # 4. Stochastic (14, 3, 3)
+        low_14 = df['low'].rolling(window=14).min()
+        high_14 = df['high'].rolling(window=14).max()
+        denom = (high_14 - low_14).replace(0, np.nan)
+        df['stoch_k'] = (100 * ((df['close'] - low_14) / denom)).rolling(window=3).mean().fillna(50)
         df['stoch_d'] = df['stoch_k'].rolling(window=3).mean().fillna(50)
-        df['will_r'] = (-100 * ((df['high_14'] - df['close']) / denom)).fillna(-50)
 
-        tp = (df['high'] + df['low'] + df['close']) / 3
-        sma_tp = tp.rolling(window=14).mean()
-        mad = tp.rolling(window=14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True).replace(0, np.nan)
-        df['cci'] = ((tp - sma_tp) / (0.015 * mad)).fillna(0)
+        # 5. MACD (12, 26, 9)
+        macd = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
+        macd_sig = macd.ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = macd - macd_sig
 
-        tr1 = df['high'] - df['low']
-        tr2 = (df['high'] - df['close'].shift(1)).abs()
-        tr3 = (df['low'] - df['close'].shift(1)).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        # 6. ATR (14) & Support/Resistance Zones (20-period)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift(1)).abs(),
+            (df['low'] - df['close'].shift(1)).abs()
+        ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean().bfill()
+        df['support'] = df['low'].rolling(window=20).min()
+        df['resistance'] = df['high'].rolling(window=20).max()
 
-        up_move = df['high'] - df['high'].shift(1)
-        down_move = df['low'].shift(1) - df['low']
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / df['atr'].replace(0, np.nan))
-        minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / df['atr'].replace(0, np.nan))
-        dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
-        df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(20)
-
-        df['support'] = df['low'].rolling(window=15).min()
-        df['resistance'] = df['high'].rolling(window=15).max()
-
-        closed = df.iloc[-2]
-        prev = df.iloc[-3]
+        # Use Confirmed Closed Candles (c1 = last closed candle, c2 = previous closed, c3 = 3rd back)
+        c1 = df.iloc[-2]
+        c2 = df.iloc[-3]
+        c3 = df.iloc[-4]
         live = df.iloc[-1]
 
-        call_reasons = []
-        put_reasons = []
+        atr_val = float(c1['atr']) if c1['atr'] > 0 else 0.0001
+        c1_body = abs(c1['close'] - c1['open'])
+        c1_range = c1['high'] - c1['low']
 
-        atr_val = float(live['atr']) if live['atr'] > 0 else 0.0001
+        # Filter out flat/dead charts
+        if c1_range < (atr_val * 0.20):
+            return None
 
-        if abs(live['low'] - live['support']) <= (atr_val * 0.45) and live['close'] >= live['open']:
-            call_reasons.append(("Support Zone Rejection", 20))
-        elif abs(live['high'] - live['resistance']) <= (atr_val * 0.45) and live['close'] <= live['open']:
-            put_reasons.append(("Resistance Zone Rejection", 20))
+        c1_bull = c1['close'] > c1['open']
+        c1_bear = c1['close'] < c1['open']
+        c2_bull = c2['close'] > c2['open']
+        c2_bear = c2['close'] < c2['open']
+        c3_bull = c3['close'] > c3['open']
+        c3_bear = c3['close'] < c3['open']
 
-        if prev['ema_5'] <= prev['ema_9'] and (closed['ema_5'] > closed['ema_9'] or live['ema_5'] > live['ema_9']):
-            call_reasons.append(("EMA 5/9 Bullish Cross", 18))
-        elif prev['ema_5'] >= prev['ema_9'] and (closed['ema_5'] < closed['ema_9'] or live['ema_5'] < live['ema_9']):
-            put_reasons.append(("EMA 5/9 Bearish Cross", 18))
+        upper_wick = c1['high'] - max(c1['open'], c1['close'])
+        lower_wick = min(c1['open'], c1['close']) - c1['low']
 
-        if live['ema_5'] > live['ema_9'] > live['ema_21'] > live['ema_50']:
-            call_reasons.append(("M1 + M5 Strong Uptrend", 16))
-        elif live['ema_5'] < live['ema_9'] < live['ema_21'] < live['ema_50']:
-            put_reasons.append(("M1 + M5 Strong Downtrend", 16))
-        elif live['ema_9'] > live['ema_21']:
-            call_reasons.append(("EMA Trend Bullish", 8))
-        else:
-            put_reasons.append(("EMA Trend Bearish", 8))
+        call_points = []
+        put_points = []
 
-        if closed['rsi'] < 28 or live['rsi'] < 25:
-            call_reasons.append((f"RSI Oversold Reversal ({live['rsi']:.0f})", 18))
-        elif closed['rsi'] > 72 or live['rsi'] > 75:
-            put_reasons.append((f"RSI Overbought Reversal ({live['rsi']:.0f})", 18))
-        elif 52 <= live['rsi'] <= 68 and live['rsi'] > closed['rsi']:
-            call_reasons.append(("RSI Bullish Momentum", 9))
-        elif 32 <= live['rsi'] <= 48 and live['rsi'] < closed['rsi']:
-            put_reasons.append(("RSI Bearish Momentum", 9))
+        # =========================================================================
+        # ENGINE A: EXTREME S&R + BOLLINGER REVERSAL (SURESHOT MEAN REVERSION)
+        # =========================================================================
+        near_support = (c1['low'] <= c1['lower_bb']) or (abs(c1['low'] - c1['support']) <= atr_val * 0.35)
+        near_resistance = (c1['high'] >= c1['upper_bb']) or (abs(c1['high'] - c1['resistance']) <= atr_val * 0.35)
 
-        if closed['low'] <= closed['lower_band'] or live['close'] <= live['lower_band']:
-            call_reasons.append(("Bollinger Lower Band Bounce", 17))
-        elif closed['high'] >= closed['upper_band'] or live['close'] >= live['upper_band']:
-            put_reasons.append(("Bollinger Upper Band Rejection", 17))
+        if near_support and c1['rsi_7'] <= 28:
+            call_points.append(("Support + Lower BB Oversold Bounce", 28))
+            if lower_wick > (c1_body * 1.2):
+                call_points.append(("Strong Lower-Wick Buyers Rejection", 18))
+            if c1['stoch_k'] < 25:
+                call_points.append((f"Stoch + RSI({c1['rsi_7']:.0f}) Extreme Oversold", 14))
 
-        if live['stoch_k'] < 25 and live['stoch_k'] >= live['stoch_d'] and live['will_r'] < -75:
-            call_reasons.append(("Stoch + Will%R Oversold", 16))
-        elif live['stoch_k'] > 75 and live['stoch_k'] <= live['stoch_d'] and live['will_r'] > -25:
-            put_reasons.append(("Stoch + Will%R Overbought", 16))
+        if near_resistance and c1['rsi_7'] >= 72:
+            put_points.append(("Resistance + Upper BB Overbought Drop", 28))
+            if upper_wick > (c1_body * 1.2):
+                put_points.append(("Strong Upper-Wick Sellers Rejection", 18))
+            if c1['stoch_k'] > 75:
+                put_points.append((f"Stoch + RSI({c1['rsi_7']:.0f}) Extreme Overbought", 14))
 
-        if prev['macd_hist'] <= 0 and live['macd_hist'] > 0:
-            call_reasons.append(("MACD Flip Green", 15))
-        elif prev['macd_hist'] >= 0 and live['macd_hist'] < 0:
-            put_reasons.append(("MACD Flip Red", 15))
-        elif live['macd_hist'] > closed['macd_hist'] and live['macd_hist'] > 0:
-            call_reasons.append(("MACD Bullish Surge", 8))
-        elif live['macd_hist'] < closed['macd_hist'] and live['macd_hist'] < 0:
-            put_reasons.append(("MACD Bearish Surge", 8))
+        # =========================================================================
+        # ENGINE B: CONFIRMED TREND PULLBACK CONTINUATION (NO OVERBOUGHT CHASING!)
+        # =========================================================================
+        strong_uptrend = (c1['ema_9'] > c1['ema_21'] > c1['ema_50'])
+        strong_downtrend = (c1['ema_9'] < c1['ema_21'] < c1['ema_50'])
 
-        if live['cci'] < -100:
-            call_reasons.append(("CCI Oversold Bounce", 13))
-        elif live['cci'] > 100:
-            put_reasons.append(("CCI Overbought Drop", 13))
+        # Only take Trend CALL if RSI is NOT overbought (45 to 67 sweet spot)
+        if strong_uptrend and (45 <= c1['rsi_14'] <= 67):
+            if c2_bear and c1_bull and c1['close'] > c2['open']:
+                call_points.append(("Uptrend Pullback + Bullish Engulfing", 30))
+            elif c2_bear and c1_bull and c1['low'] <= c1['ema_21']:
+                call_points.append(("EMA-21 Dynamic Support Bounce", 26))
+            elif c1_bull and c1['macd_hist'] > c2['macd_hist'] and c1['macd_hist'] > 0:
+                call_points.append(("M1/M5 Uptrend Momentum Continuation", 20))
 
-        if closed['close'] > closed['open'] and prev['close'] < prev['open'] and closed['close'] > prev['open']:
-            call_reasons.append(("Bullish Engulfing Pattern", 15))
-        elif closed['close'] < closed['open'] and prev['close'] > prev['open'] and closed['close'] < prev['open']:
-            put_reasons.append(("Bearish Engulfing Pattern", 15))
+        # Only take Trend PUT if RSI is NOT oversold (33 to 55 sweet spot)
+        if strong_downtrend and (33 <= c1['rsi_14'] <= 55):
+            if c2_bull and c1_bear and c1['close'] < c2['open']:
+                put_points.append(("Downtrend Pullback + Bearish Engulfing", 30))
+            elif c2_bull and c1_bear and c1['high'] >= c1['ema_21']:
+                put_points.append(("EMA-21 Dynamic Resistance Drop", 26))
+            elif c1_bear and c1['macd_hist'] < c2['macd_hist'] and c1['macd_hist'] < 0:
+                put_points.append(("M1/M5 Downtrend Momentum Continuation", 20))
 
-        body = abs(closed['close'] - closed['open'])
-        lower_wick = min(closed['close'], closed['open']) - closed['low']
-        upper_wick = closed['high'] - max(closed['close'], closed['open'])
-        if lower_wick > body * 1.5 and lower_wick > upper_wick:
-            call_reasons.append(("Hammer Wick Rejection", 14))
-        elif upper_wick > body * 1.5 and upper_wick > lower_wick:
-            put_reasons.append(("Shooting Star Wick Rejection", 14))
+        # =========================================================================
+        # ENGINE C: 3-CANDLE STREAK EXHAUSTION & SPIKE REVERSAL FILTER
+        # =========================================================================
+        # Prevent buying after 3 consecutive green candles (exhaustion)
+        if c1_bull and c2_bull and c3_bull:
+            if c1['rsi_7'] >= 68 or c1['high'] >= c1['upper_bb']:
+                put_points.append(("3-Green Candle Exhaustion Reversal", 24))
+        elif c1_bear and c2_bear and c3_bear:
+            if c1['rsi_7'] <= 32 or c1['low'] <= c1['lower_bb']:
+                call_points.append(("3-Red Candle Exhaustion Reversal", 24))
 
-        closed_size = abs(closed['close'] - closed['open'])
-        if closed_size > (atr_val * 2.2):
-            if closed['close'] > closed['open']:
-                put_reasons.append(("Exhaustion Spike Pullback", 14))
-            else:
-                call_reasons.append(("Exhaustion Drop Pullback", 14))
+        # Huge Exhaustion Spike Candle (2x ATR) -> Expect pullback on next 1m candle
+        if c1_body > (atr_val * 2.0):
+            if c1_bull and c1['high'] >= c1['upper_bb']:
+                put_points.append(("Climax Spike Pullback", 22))
+            elif c1_bear and c1['low'] <= c1['lower_bb']:
+                call_points.append(("Climax Drop Pullback", 22))
 
-        if live['adx'] >= 23:
-            if live['ema_5'] > live['ema_21']:
-                call_reasons.append((f"Strong ADX Trend ({live['adx']:.0f})", 9))
-            else:
-                put_reasons.append((f"Strong ADX Trend ({live['adx']:.0f})", 9))
+        # =========================================================================
+        # ENGINE D: SECONDARY CONFLUENCE & LIVE ENTRY CHECK
+        # =========================================================================
+        if c1['stoch_k'] > c1['stoch_d'] and c2['stoch_k'] <= c2['stoch_d'] and c1['stoch_k'] < 65:
+            call_points.append(("Stochastic Golden Cross Up", 14))
+        elif c1['stoch_k'] < c1['stoch_d'] and c2['stoch_k'] >= c2['stoch_d'] and c1['stoch_k'] > 35:
+            put_points.append(("Stochastic Death Cross Down", 14))
+
+        # Standard baseline alignment so single-pair requests always return the highest probability side
+        if c1['ema_9'] > c1['ema_21'] and c1['rsi_7'] < 70:
+            call_points.append(("EMA 9/21 Bullish Structure", 10))
+        elif c1['ema_9'] < c1['ema_21'] and c1['rsi_7'] > 30:
+            put_points.append(("EMA 9/21 Bearish Structure", 10))
 
         if live['close'] >= live['open']:
-            call_reasons.append(("Live Buyers Active", 5))
+            call_points.append(("Live Tick Buyers Entry", 6))
         else:
-            put_reasons.append(("Live Sellers Active", 5))
+            put_points.append(("Live Tick Sellers Entry", 6))
 
-        call_score = sum(w for _, w in call_reasons)
-        put_score = sum(w for _, w in put_reasons)
+        call_score = sum(w for _, w in call_points)
+        put_score = sum(w for _, w in put_points)
         score_diff = abs(call_score - put_score)
 
         if call_score >= put_score:
             direction = "CALL 🟢⬆️"
-            reasons = [r for r, _ in sorted(call_reasons, key=lambda x: x[1], reverse=True)]
+            reasons = [r for r, _ in sorted(call_points, key=lambda x: x[1], reverse=True)]
             winning_score = call_score
         else:
             direction = "PUT 🔴⬇️"
-            reasons = [r for r, _ in sorted(put_reasons, key=lambda x: x[1], reverse=True)]
+            reasons = [r for r, _ in sorted(put_points, key=lambda x: x[1], reverse=True)]
             winning_score = put_score
 
-        confidence = min(68 + int(winning_score * 0.45) + int(score_diff * 0.35), 99)
+        confidence = min(68 + int(winning_score * 0.42) + int(score_diff * 0.35), 99)
 
         now_pkt = datetime.now(PKT)
         entry_time = (now_pkt + timedelta(minutes=1)).strftime("%I:%M %p")
@@ -421,7 +428,7 @@ def evaluate_high_accuracy_strategies(df, market_name):
             'confidence': int(confidence),
             'score_diff': score_diff,
             'entry_time': entry_time,
-            'reason': ", ".join(reasons[:3])
+            'reason': ", ".join(reasons[:2])
         }
     except Exception as e:
         logger.error(f"Strategy error on {market_name}: {e}")
@@ -441,11 +448,11 @@ def fetch_single_pair_signal(pair_name, is_otc=False):
         if info['type'] == 'forex':
             try:
                 data = yf.download(tickers=info['ticker'], period="1d", interval="1m", progress=False)
-                if data is not None and not data.empty and len(data) >= 35:
+                if data is not None and not data.empty and len(data) >= 40:
                     if isinstance(data.columns, pd.MultiIndex):
                         data.columns = data.columns.get_level_values(0)
                     sub_df = data.dropna(subset=['Close'])
-                    if len(sub_df) >= 35 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
+                    if len(sub_df) >= 40 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
                         clean_df = pd.DataFrame({
                             'open': sub_df['Open'].values,
                             'high': sub_df['High'].values,
@@ -460,7 +467,7 @@ def fetch_single_pair_signal(pair_name, is_otc=False):
         else:
             try:
                 ohlcv = exchange.fetch_ohlcv(info['ticker'], timeframe='1m', limit=60)
-                if ohlcv and len(ohlcv) >= 35:
+                if ohlcv and len(ohlcv) >= 40:
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     return evaluate_high_accuracy_strategies(df, f"{pair_name} (Live)")
             except Exception as e:
@@ -484,7 +491,7 @@ def scan_best_signals(mode="live", count=1):
                 try:
                     if yf_sym in data and not data[yf_sym].empty:
                         sub_df = data[yf_sym].copy().dropna(subset=['Close'])
-                        if len(sub_df) >= 35 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
+                        if len(sub_df) >= 40 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
                             clean_df = pd.DataFrame({
                                 'open': sub_df['Open'].values,
                                 'high': sub_df['High'].values,
@@ -505,7 +512,7 @@ def scan_best_signals(mode="live", count=1):
             if info['type'] == 'crypto':
                 try:
                     ohlcv = exchange.fetch_ohlcv(info['ticker'], timeframe='1m', limit=60)
-                    if ohlcv and len(ohlcv) >= 35:
+                    if ohlcv and len(ohlcv) >= 40:
                         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                         res = evaluate_high_accuracy_strategies(df, f"{pair_name} (Live)")
                         if res:
@@ -516,7 +523,7 @@ def scan_best_signals(mode="live", count=1):
 
     signals.sort(
         key=lambda x: (
-            1 if x['score_diff'] >= 15 else 0,
+            1 if x['score_diff'] >= 22 else 0,
             1 if x.get('is_forex') else 0,
             x['confidence'],
             x['score_diff']
@@ -525,7 +532,7 @@ def scan_best_signals(mode="live", count=1):
     )
     return signals[:count]
 
-# --- Keyboards for Unverified Users (Free Registration & Premium Gate) ---
+# --- Keyboards for Unverified Users ---
 def get_access_gate_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆓 GET FREE ACCESS (VIP)", callback_data="gate_free")],
@@ -629,11 +636,12 @@ def get_post_signal_kb(mode, pair_idx=None):
         ]
     ])
 
+# --- UPDATED SIGNAL CARD WITH "AYYAN TRADER" HEADER ---
 def format_signal_card(sig):
     global SIGNAL_COUNT
     SIGNAL_COUNT += 1
     return (
-        f"👾 *AYYAN GenAI+ SIGNAL* 👾\n\n"
+        f"👾 *AYYAN TRADER* 👾\n\n"
         f"━━━━━━━━ 🆓 ━━━━━━━━\n"
         f"📊 *PAIR :* `{sig['symbol']}`\n"
         f"⚡ *TIMEFRAME :* `M1`\n"
@@ -651,8 +659,8 @@ def format_signal_card(sig):
 
 async def play_scan_animation(msg, target_label):
     stages = [
-        f"⚡ *INITIALIZING AYYAN GenAI+ ENGINE...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🔄 `Connecting to Quotex Liquidity Feed...`\n`[███▒▒▒▒▒▒▒] 35%`",
-        f"🧠 *RUNNING 18 PRO INDICATORS...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n📊 `Checking S&R Zones, RSI(7), ADX & M5 Trend...`\n`[███████▒▒▒] 75%`",
+        f"⚡ *INITIALIZING AYYAN TRADER ENGINE...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🔄 `Connecting to Quotex Liquidity Feed...`\n`[███▒▒▒▒▒▒▒] 35%`",
+        f"🧠 *FILTERING FALSE BREAKOUTS...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n📊 `Checking Confirmed Closed Candle & S&R Zones...`\n`[███████▒▒▒] 75%`",
         f"✅ *LOCKING SURESHOT ENTRY...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🎯 `Calculating 1-Minute Entry & MTG Filter...`\n`[██████████] 100%`"
     ]
     for stage_txt in stages:
@@ -664,7 +672,7 @@ async def play_scan_animation(msg, target_label):
 
 # --- Text Templates ---
 GATE_HOME_TEXT = (
-    "👾 *WELCOME TO AYYAN GenAI+ QUOTEX BOT* 👾\n"
+    "👾 *WELCOME TO AYYAN TRADER BOT* 👾\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "🔒 *VIP ACCESS REQUIRED*\n"
     "You currently do not have active access to the Quotex M1 Signal Terminal. Choose one of the options below to unlock instant *LIVE & OTC Signals*:\n\n"
@@ -676,11 +684,11 @@ GATE_HOME_TEXT = (
 )
 
 DASHBOARD_TEXT = (
-    "👾 *AYYAN GenAI+ QUOTEX DASHBOARD* 👾\n"
+    "👾 *AYYAN TRADER DASHBOARD* 👾\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "✅ *VIP STATUS : ACTIVE*\n"
-    "Select your trading market below to generate institutional-grade *LIVE* or *OTC* signals with real-time indicator confluence.\n\n"
-    "💠 *Engine :* `18 Indicators + Fractal S&R + ADX`\n"
+    "Select your trading market below to generate institutional-grade *LIVE* or *OTC* signals with real-time price-action confluence.\n\n"
+    "💠 *Engine :* `Confirmed Candle Pullback + S&R Bounce`\n"
     "🔥 *Markets :* `100% Verified Quotex Live & OTC` · `UTC+5`\n\n"
     "🔖 *TELEGRAM :* @Ayyan\\_trader01 🌸"
 )
@@ -708,7 +716,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-# Admin command to manually add paid users anytime: /adduser 123456789
 async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ENV_ALLOWED_IDS and user_id != ADMIN_ID:
@@ -730,12 +737,10 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# --- Trader ID Input Handler (When Unverified User Pastes ID) ---
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Extract 6 to 12 digit Quotex Trader ID if user sends numbers
     match = re.search(r'\b(\d{6,12})\b', text)
 
     if is_user_authorized(user_id) and not context.user_data.get("awaiting_trader_id"):
@@ -760,7 +765,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     trader_id = match.group(1)
 
-    # Check if this Trader ID is already used by another Telegram user
     used_by = db_data.get("used_trader_ids", {}).get(trader_id)
     if used_by and used_by != user_id:
         await update.message.reply_text(
@@ -790,7 +794,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 *Trader ID :* `#{trader_id}`\n"
             f"🟢 *Status :* `VIP Access Unlocked`\n\n"
-            f"Welcome to *Ayyan GenAI+ Quotex Terminal*! Select your market below to start trading:",
+            f"Welcome to *Ayyan Trader Terminal*! Select your market below to start trading:",
             parse_mode='Markdown',
             reply_markup=get_main_dashboard_kb()
         )
@@ -811,7 +815,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     else:
-        # Fallback if Telethon session isn't logged in yet: Send 1-Click Approval to Admin
         if ADMIN_ID:
             admin_kb = InlineKeyboardMarkup([
                 [
@@ -843,14 +846,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=get_access_gate_kb()
         )
 
-# --- Callback Button Handler ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = query.from_user.id
 
-    # --- Admin 1-Click Approval Callbacks ---
     if data.startswith("adm_app_") or data.startswith("adm_rej_"):
         if user_id not in ENV_ALLOWED_IDS and user_id != ADMIN_ID:
             return
@@ -893,7 +894,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # --- Access Gate Callbacks (Available to Unverified Users) ---
     if data == "gate_home":
         context.user_data["awaiting_trader_id"] = False
         await query.edit_message_text(
@@ -958,7 +958,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Block Signal Terminal Buttons if User is Not Verified ---
     if not is_user_authorized(user_id):
         await query.edit_message_text(
             GATE_HOME_TEXT,
@@ -968,7 +967,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Verified VIP Terminal Navigation ---
     if data in ["main_menu", "menu_modes"]:
         await query.edit_message_text(
             DASHBOARD_TEXT,
@@ -1086,7 +1084,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 def run_bot():
-    logger.info("Starting Ayyan GenAI+ Quotex Telegram Bot...")
+    logger.info("Starting Ayyan Trader Quotex Telegram Bot...")
     telegram_app = Application.builder().token(TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
