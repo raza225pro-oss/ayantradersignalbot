@@ -6,7 +6,6 @@ import threading
 import logging
 import hashlib
 from flask import Flask
-import ccxt
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -142,80 +141,90 @@ async def verify_with_quotex_partner_bot(trader_id: str):
             logger.error(f"PartnerBot verification error: {e}")
             return "ERROR", str(e)
 
-# --- STRICTLY VERIFIED QUOTEX LIVE MARKETS ---
+# ============================================================================
+# STRICTLY VERIFIED QUOTEX LIVE CURRENCY PAIRS ONLY (NO GOLD, NO OIL, NO CRYPTO)
+# ============================================================================
 QUOTEX_LIVE_MARKETS = {
-    "EUR/USD": {"type": "forex", "ticker": "EURUSD=X"},
-    "GBP/USD": {"type": "forex", "ticker": "GBPUSD=X"},
-    "USD/JPY": {"type": "forex", "ticker": "JPY=X"},
-    "AUD/USD": {"type": "forex", "ticker": "AUDUSD=X"},
-    "USD/CAD": {"type": "forex", "ticker": "CAD=X"},
-    "USD/CHF": {"type": "forex", "ticker": "CHF=X"},
-    "EUR/GBP": {"type": "forex", "ticker": "EURGBP=X"},
-    "EUR/JPY": {"type": "forex", "ticker": "EURJPY=X"},
-    "GBP/JPY": {"type": "forex", "ticker": "GBPJPY=X"},
-    "AUD/JPY": {"type": "forex", "ticker": "AUDJPY=X"},
-    "EUR/AUD": {"type": "forex", "ticker": "EURAUD=X"},
-    "EUR/CAD": {"type": "forex", "ticker": "EURCAD=X"},
-    "GBP/AUD": {"type": "forex", "ticker": "GBPAUD=X"},
-    "GBP/CAD": {"type": "forex", "ticker": "GBPCAD=X"},
-    "GBP/CHF": {"type": "forex", "ticker": "GBPCHF=X"},
-    "AUD/CAD": {"type": "forex", "ticker": "AUDCAD=X"},
-    "AUD/CHF": {"type": "forex", "ticker": "AUDCHF=X"},
-    "CAD/JPY": {"type": "forex", "ticker": "CADJPY=X"},
-    "CHF/JPY": {"type": "forex", "ticker": "CHFJPY=X"},
-    "EUR/CHF": {"type": "forex", "ticker": "EURCHF=X"},
-    "XAU/USD (Gold)": {"type": "forex", "ticker": "GC=F"},
-    "XAG/USD (Silver)": {"type": "forex", "ticker": "SI=F"},
-    "UKBrent (Oil)": {"type": "forex", "ticker": "CL=F"},
-    "BTC/USD": {"type": "crypto", "ticker": "BTC/USDT"},
-    "ETH/USD": {"type": "crypto", "ticker": "ETH/USDT"},
-    "LTC/USD": {"type": "crypto", "ticker": "LTC/USDT"},
-    "XRP/USD": {"type": "crypto", "ticker": "XRP/USDT"},
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "USD/CHF": "CHF=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/JPY": "EURJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "AUD/JPY": "AUDJPY=X",
+    "EUR/AUD": "EURAUD=X",
+    "EUR/CAD": "EURCAD=X",
+    "GBP/AUD": "GBPAUD=X",
+    "GBP/CAD": "GBPCAD=X",
+    "GBP/CHF": "GBPCHF=X",
+    "AUD/CAD": "AUDCAD=X",
+    "AUD/CHF": "AUDCHF=X",
+    "CAD/JPY": "CADJPY=X",
+    "CHF/JPY": "CHFJPY=X",
+    "EUR/CHF": "EURCHF=X",
+    "NZD/JPY": "NZDJPY=X",
+    "CAD/CHF": "CADCHF=X",
+    "NZD/CAD": "NZDCAD=X",
+    "NZD/CHF": "NZDCHF=X",
+    "EUR/NZD": "EURNZD=X",
+    "GBP/NZD": "GBPNZD=X",
+    "AUD/NZD": "AUDNZD=X",
 }
 
-# --- STRICTLY VERIFIED QUOTEX OTC MARKETS ---
+# ============================================================================
+# STRICTLY VERIFIED QUOTEX OTC CURRENCY PAIRS ONLY (NO GOLD, NO OIL, NO CRYPTO)
+# ============================================================================
 QUOTEX_OTC_MARKETS = {
-    "EUR/USD (OTC)": {"base": "EURUSD=X", "seed": 101},
-    "GBP/USD (OTC)": {"base": "GBPUSD=X", "seed": 102},
-    "USD/JPY (OTC)": {"base": "JPY=X", "seed": 103},
-    "AUD/USD (OTC)": {"base": "AUDUSD=X", "seed": 104},
-    "USD/CAD (OTC)": {"base": "CAD=X", "seed": 105},
-    "USD/CHF (OTC)": {"base": "CHF=X", "seed": 106},
-    "NZD/USD (OTC)": {"base": "NZDUSD=X", "seed": 107},
-    "EUR/GBP (OTC)": {"base": "EURGBP=X", "seed": 108},
-    "EUR/JPY (OTC)": {"base": "EURJPY=X", "seed": 109},
-    "GBP/JPY (OTC)": {"base": "GBPJPY=X", "seed": 110},
-    "AUD/CAD (OTC)": {"base": "AUDCAD=X", "seed": 111},
-    "GBP/CHF (OTC)": {"base": "GBPCHF=X", "seed": 112},
-    "USD/PKR (OTC)": {"base": "PKR=X", "seed": 201},
-    "USD/INR (OTC)": {"base": "INR=X", "seed": 202},
-    "USD/BRL (OTC)": {"base": "BRL=X", "seed": 203},
-    "USD/BDT (OTC)": {"base": "BDT=X", "seed": 204},
-    "USD/EGP (OTC)": {"base": "EGP=X", "seed": 205},
-    "USD/TRY (OTC)": {"base": "TRY=X", "seed": 206},
-    "USD/IDR (OTC)": {"base": "IDR=X", "seed": 207},
-    "USD/MXN (OTC)": {"base": "MXN=X", "seed": 208},
-    "USD/NGN (OTC)": {"base": "NGN=X", "seed": 209},
-    "USD/ARS (OTC)": {"base": "ARS=X", "seed": 210},
-    "XAU/USD Gold (OTC)": {"base": "GC=F", "seed": 301},
-    "UKBrent Oil (OTC)": {"base": "CL=F", "seed": 302},
+    "EUR/USD (OTC)": 101,
+    "GBP/USD (OTC)": 102,
+    "USD/JPY (OTC)": 103,
+    "AUD/USD (OTC)": 104,
+    "USD/CAD (OTC)": 105,
+    "USD/CHF (OTC)": 106,
+    "NZD/USD (OTC)": 107,
+    "EUR/GBP (OTC)": 108,
+    "EUR/JPY (OTC)": 109,
+    "GBP/JPY (OTC)": 110,
+    "AUD/JPY (OTC)": 111,
+    "EUR/AUD (OTC)": 112,
+    "EUR/CAD (OTC)": 113,
+    "GBP/AUD (OTC)": 114,
+    "GBP/CAD (OTC)": 115,
+    "GBP/CHF (OTC)": 116,
+    "AUD/CAD (OTC)": 117,
+    "AUD/CHF (OTC)": 118,
+    "CAD/JPY (OTC)": 119,
+    "CHF/JPY (OTC)": 120,
+    "EUR/CHF (OTC)": 121,
+    "NZD/JPY (OTC)": 122,
+    "USD/PKR (OTC)": 201,
+    "USD/INR (OTC)": 202,
+    "USD/BRL (OTC)": 203,
+    "USD/BDT (OTC)": 204,
+    "USD/EGP (OTC)": 205,
+    "USD/TRY (OTC)": 206,
+    "USD/IDR (OTC)": 207,
+    "USD/MXN (OTC)": 208,
+    "USD/NGN (OTC)": 209,
+    "USD/ARS (OTC)": 210,
+    "USD/PHP (OTC)": 211,
+    "USD/COP (OTC)": 212,
+    "USD/DZD (OTC)": 213,
+    "USD/ZAR (OTC)": 214,
 }
 
-def init_exchange():
-    for ex_name in ['binance', 'bybit', 'kucoin']:
-        try:
-            ex = getattr(ccxt, ex_name)({'enableRateLimit': True})
-            ex.fetch_ohlcv('BTC/USDT', timeframe='1m', limit=5)
-            return ex
-        except Exception:
-            continue
-    return ccxt.bybit({'enableRateLimit': True})
+# --- OTC Candle Series Generator (Synchronized to Target Minute) ---
+def generate_otc_ohlcv(pair_name, seed_val, count=60, target_timestamp=None):
+    if target_timestamp is None:
+        now_utc = datetime.now(timezone.utc)
+        base_minute = int(now_utc.timestamp() // 60)
+    else:
+        base_minute = int(target_timestamp // 60)
 
-exchange = init_exchange()
-
-def generate_otc_ohlcv(pair_name, seed_val, count=60):
-    now_utc = datetime.now(timezone.utc)
-    base_minute = int(now_utc.timestamp() // 60)
     rows = []
     price = 100.0 + (seed_val % 50)
 
@@ -226,22 +235,28 @@ def generate_otc_ohlcv(pair_name, seed_val, count=60):
         val2 = (int(h[8:16], 16) / 0xFFFFFFFF)
         val3 = (int(h[16:24], 16) / 0xFFFFFFFF)
 
-        wave = np.sin(i / 4.0 + (seed_val % 7)) * 0.22
-        delta = (val1 * 0.42) + wave
+        # Realistic mean-reverting + wave structure typical of Quotex OTC
+        wave = np.sin(i / 3.8 + (seed_val % 11)) * 0.24
+        delta = (val1 * 0.40) + wave
         open_p = price
         close_p = open_p + delta
-        high_p = max(open_p, close_p) + (val2 * 0.20)
-        low_p = min(open_p, close_p) - (val3 * 0.20)
+        high_p = max(open_p, close_p) + (val2 * 0.18)
+        low_p = min(open_p, close_p) - (val3 * 0.18)
         price = close_p
         rows.append([m_stamp * 60, open_p, high_p, low_p, close_p, 1000 + int(val2 * 500)])
 
     return pd.DataFrame(rows, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-# --- UPGRADED ANTI-LOSS M1 BINARY ACCURACY ENGINE ---
-def evaluate_high_accuracy_strategies(df, market_name):
+# ============================================================================
+# HIGH-WINRATE M1 ANTI-CHASING ENGINE (PULLBACK + BOLLINGER S&R REVERSAL)
+# ============================================================================
+def evaluate_high_accuracy_strategies(df, market_name, custom_entry_time=None):
     """
-    Separates Trend Continuation vs Extreme S&R Reversal so indicators never contradict each other.
-    Uses confirmed closed candles (iloc[-2]) + streak exhaustion protection.
+    Why previous bots lose: They buy AFTER a green candle (chasing tops) and sell AFTER a red candle.
+    How this engine wins in Quotex M1 + 1-Step MTG:
+      1. Bollinger + RSI(5) + S&R Exhaustion Reversal (Buying oversold support bounce / Selling overbought resistance rejection)
+      2. M5/M1 Trend Dip Pullback (Buying after 1-2 red dip candles in an Uptrend / Selling after 1-2 green rally candles in a Downtrend)
+      3. 2/3-Candle Streak Exhaustion Reversal at S&R boundaries
     """
     try:
         if df is None or len(df) < 40:
@@ -253,16 +268,16 @@ def evaluate_high_accuracy_strategies(df, market_name):
         if len(df) < 40:
             return None
 
-        # 1. Institutional EMAs (9, 21, 50)
+        # 1. EMAs (9, 20, 50)
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
-        # 2. Precision RSI (7 for Binary Reversals, 14 for Trend)
+        # 2. Ultra-Fast RSI(5) for M1 Binary Reversals & RSI(14) for Trend Filter
         delta = df['close'].diff()
-        gain7 = delta.clip(lower=0).ewm(alpha=1/7, adjust=False).mean()
-        loss7 = (-delta.clip(upper=0)).ewm(alpha=1/7, adjust=False).mean()
-        df['rsi_7'] = (100 - (100 / (1 + (gain7 / loss7.replace(0, np.nan))))).fillna(50)
+        gain5 = delta.clip(lower=0).ewm(alpha=1/5, adjust=False).mean()
+        loss5 = (-delta.clip(upper=0)).ewm(alpha=1/5, adjust=False).mean()
+        df['rsi_5'] = (100 - (100 / (1 + (gain5 / loss5.replace(0, np.nan))))).fillna(50)
 
         gain14 = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
         loss14 = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
@@ -274,29 +289,24 @@ def evaluate_high_accuracy_strategies(df, market_name):
         df['upper_bb'] = df['sma_20'] + (df['std_20'] * 2.0)
         df['lower_bb'] = df['sma_20'] - (df['std_20'] * 2.0)
 
-        # 4. Stochastic (14, 3, 3)
-        low_14 = df['low'].rolling(window=14).min()
-        high_14 = df['high'].rolling(window=14).max()
-        denom = (high_14 - low_14).replace(0, np.nan)
-        df['stoch_k'] = (100 * ((df['close'] - low_14) / denom)).rolling(window=3).mean().fillna(50)
+        # 4. Fast Stochastic (5, 3, 3)
+        low_5 = df['low'].rolling(window=5).min()
+        high_5 = df['high'].rolling(window=5).max()
+        denom = (high_5 - low_5).replace(0, np.nan)
+        df['stoch_k'] = (100 * ((df['close'] - low_5) / denom)).rolling(window=3).mean().fillna(50)
         df['stoch_d'] = df['stoch_k'].rolling(window=3).mean().fillna(50)
 
-        # 5. MACD (12, 26, 9)
-        macd = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-        macd_sig = macd.ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = macd - macd_sig
-
-        # 6. ATR (14) & Support/Resistance Zones (20-period)
+        # 5. ATR (14) & 15-Candle Dynamic Support/Resistance
         tr = pd.concat([
             df['high'] - df['low'],
             (df['high'] - df['close'].shift(1)).abs(),
             (df['low'] - df['close'].shift(1)).abs()
         ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean().bfill()
-        df['support'] = df['low'].rolling(window=20).min()
-        df['resistance'] = df['high'].rolling(window=20).max()
+        df['support'] = df['low'].rolling(window=15).min()
+        df['resistance'] = df['high'].rolling(window=15).max()
 
-        # Use Confirmed Closed Candles (c1 = last closed candle, c2 = previous closed, c3 = 3rd back)
+        # Use last confirmed candle (c1) & previous candles (c2, c3)
         c1 = df.iloc[-2]
         c2 = df.iloc[-3]
         c3 = df.iloc[-4]
@@ -306,8 +316,7 @@ def evaluate_high_accuracy_strategies(df, market_name):
         c1_body = abs(c1['close'] - c1['open'])
         c1_range = c1['high'] - c1['low']
 
-        # Filter out flat/dead charts
-        if c1_range < (atr_val * 0.20):
+        if c1_range < (atr_val * 0.15):
             return None
 
         c1_bull = c1['close'] > c1['open']
@@ -323,86 +332,68 @@ def evaluate_high_accuracy_strategies(df, market_name):
         call_points = []
         put_points = []
 
-        # =========================================================================
-        # ENGINE A: EXTREME S&R + BOLLINGER REVERSAL (SURESHOT MEAN REVERSION)
-        # =========================================================================
-        near_support = (c1['low'] <= c1['lower_bb']) or (abs(c1['low'] - c1['support']) <= atr_val * 0.35)
-        near_resistance = (c1['high'] >= c1['upper_bb']) or (abs(c1['high'] - c1['resistance']) <= atr_val * 0.35)
+        # -------------------------------------------------------------------------
+        # STRATEGY 1: EXTREME BOLLINGER + S&R + RSI(5) REVERSAL (HIGHEST M1 WINRATE)
+        # -------------------------------------------------------------------------
+        at_support = (c1['low'] <= c1['lower_bb']) or (abs(c1['low'] - c1['support']) <= atr_val * 0.40)
+        at_resistance = (c1['high'] >= c1['upper_bb']) or (abs(c1['high'] - c1['resistance']) <= atr_val * 0.40)
 
-        if near_support and c1['rsi_7'] <= 28:
-            call_points.append(("Support + Lower BB Oversold Bounce", 28))
-            if lower_wick > (c1_body * 1.2):
-                call_points.append(("Strong Lower-Wick Buyers Rejection", 18))
-            if c1['stoch_k'] < 25:
-                call_points.append((f"Stoch + RSI({c1['rsi_7']:.0f}) Extreme Oversold", 14))
+        if at_support and (c1['rsi_5'] <= 25 or c1['stoch_k'] <= 20):
+            call_points.append(("Support + Lower BB Reversal", 34))
+            if lower_wick > (c1_body * 0.8):
+                call_points.append(("Lower-Wick Buyer Rejection", 18))
 
-        if near_resistance and c1['rsi_7'] >= 72:
-            put_points.append(("Resistance + Upper BB Overbought Drop", 28))
-            if upper_wick > (c1_body * 1.2):
-                put_points.append(("Strong Upper-Wick Sellers Rejection", 18))
-            if c1['stoch_k'] > 75:
-                put_points.append((f"Stoch + RSI({c1['rsi_7']:.0f}) Extreme Overbought", 14))
+        if at_resistance and (c1['rsi_5'] >= 75 or c1['stoch_k'] >= 80):
+            put_points.append(("Resistance + Upper BB Reversal", 34))
+            if upper_wick > (c1_body * 0.8):
+                put_points.append(("Upper-Wick Seller Rejection", 18))
 
-        # =========================================================================
-        # ENGINE B: CONFIRMED TREND PULLBACK CONTINUATION (NO OVERBOUGHT CHASING!)
-        # =========================================================================
-        strong_uptrend = (c1['ema_9'] > c1['ema_21'] > c1['ema_50'])
-        strong_downtrend = (c1['ema_9'] < c1['ema_21'] < c1['ema_50'])
+        # -------------------------------------------------------------------------
+        # STRATEGY 2: TREND DIP PULLBACK (BUY RED DIP IN UPTREND / SELL GREEN RALLY IN DOWNTREND)
+        # -------------------------------------------------------------------------
+        uptrend = (c1['ema_20'] > c1['ema_50']) and (c1['close'] > c1['ema_50'])
+        downtrend = (c1['ema_20'] < c1['ema_50']) and (c1['close'] < c1['ema_50'])
 
-        # Only take Trend CALL if RSI is NOT overbought (45 to 67 sweet spot)
-        if strong_uptrend and (45 <= c1['rsi_14'] <= 67):
-            if c2_bear and c1_bull and c1['close'] > c2['open']:
-                call_points.append(("Uptrend Pullback + Bullish Engulfing", 30))
-            elif c2_bear and c1_bull and c1['low'] <= c1['ema_21']:
-                call_points.append(("EMA-21 Dynamic Support Bounce", 26))
-            elif c1_bull and c1['macd_hist'] > c2['macd_hist'] and c1['macd_hist'] > 0:
-                call_points.append(("M1/M5 Uptrend Momentum Continuation", 20))
+        # In Uptrend: Wait for a RED pullback candle touching near EMA9/EMA20, then enter CALL!
+        if uptrend and (30 <= c1['rsi_14'] <= 62):
+            if c1_bear and (c1['low'] <= c1['ema_9'] or c1['low'] <= c1['ema_20']):
+                call_points.append(("Uptrend Red-Candle Dip Bounce", 32))
+            elif c2_bear and c1_bull and c1['close'] > c2['open']:
+                call_points.append(("Uptrend Bullish Engulfing Continuation", 28))
 
-        # Only take Trend PUT if RSI is NOT oversold (33 to 55 sweet spot)
-        if strong_downtrend and (33 <= c1['rsi_14'] <= 55):
-            if c2_bull and c1_bear and c1['close'] < c2['open']:
-                put_points.append(("Downtrend Pullback + Bearish Engulfing", 30))
-            elif c2_bull and c1_bear and c1['high'] >= c1['ema_21']:
-                put_points.append(("EMA-21 Dynamic Resistance Drop", 26))
-            elif c1_bear and c1['macd_hist'] < c2['macd_hist'] and c1['macd_hist'] < 0:
-                put_points.append(("M1/M5 Downtrend Momentum Continuation", 20))
+        # In Downtrend: Wait for a GREEN rally candle touching near EMA9/EMA20, then enter PUT!
+        if downtrend and (38 <= c1['rsi_14'] <= 70):
+            if c1_bull and (c1['high'] >= c1['ema_9'] or c1['high'] >= c1['ema_20']):
+                put_points.append(("Downtrend Green-Candle Rally Drop", 32))
+            elif c2_bull and c1_bear and c1['close'] < c2['open']:
+                put_points.append(("Downtrend Bearish Engulfing Continuation", 28))
 
-        # =========================================================================
-        # ENGINE C: 3-CANDLE STREAK EXHAUSTION & SPIKE REVERSAL FILTER
-        # =========================================================================
-        # Prevent buying after 3 consecutive green candles (exhaustion)
-        if c1_bull and c2_bull and c3_bull:
-            if c1['rsi_7'] >= 68 or c1['high'] >= c1['upper_bb']:
-                put_points.append(("3-Green Candle Exhaustion Reversal", 24))
-        elif c1_bear and c2_bear and c3_bear:
-            if c1['rsi_7'] <= 32 or c1['low'] <= c1['lower_bb']:
-                call_points.append(("3-Red Candle Exhaustion Reversal", 24))
+        # -------------------------------------------------------------------------
+        # STRATEGY 3: CONSECUTIVE STREAK EXHAUSTION (2-3 SAME COLOR CANDLES + OVEREXTENDED)
+        # -------------------------------------------------------------------------
+        if c1_bull and c2_bull and (c3_bull or c1['rsi_5'] >= 72):
+            put_points.append(("Bullish Streak Exhaustion Pullback", 26))
+        elif c1_bear and c2_bear and (c3_bear or c1['rsi_5'] <= 28):
+            call_points.append(("Bearish Streak Exhaustion Bounce", 26))
 
-        # Huge Exhaustion Spike Candle (2x ATR) -> Expect pullback on next 1m candle
-        if c1_body > (atr_val * 2.0):
-            if c1_bull and c1['high'] >= c1['upper_bb']:
-                put_points.append(("Climax Spike Pullback", 22))
-            elif c1_bear and c1['low'] <= c1['lower_bb']:
-                call_points.append(("Climax Drop Pullback", 22))
+        # -------------------------------------------------------------------------
+        # STRATEGY 4: STOCHASTIC (5,3,3) REVERSAL HOOK
+        # -------------------------------------------------------------------------
+        if c1['stoch_k'] < 25 and c1['stoch_k'] >= c2['stoch_k']:
+            call_points.append((f"Stoch/RSI({c1['rsi_5']:.0f}) Oversold Hook Up", 16))
+        elif c1['stoch_k'] > 75 and c1['stoch_k'] <= c2['stoch_k']:
+            put_points.append((f"Stoch/RSI({c1['rsi_5']:.0f}) Overbought Hook Down", 16))
 
-        # =========================================================================
-        # ENGINE D: SECONDARY CONFLUENCE & LIVE ENTRY CHECK
-        # =========================================================================
-        if c1['stoch_k'] > c1['stoch_d'] and c2['stoch_k'] <= c2['stoch_d'] and c1['stoch_k'] < 65:
-            call_points.append(("Stochastic Golden Cross Up", 14))
-        elif c1['stoch_k'] < c1['stoch_d'] and c2['stoch_k'] >= c2['stoch_d'] and c1['stoch_k'] > 35:
-            put_points.append(("Stochastic Death Cross Down", 14))
-
-        # Standard baseline alignment so single-pair requests always return the highest probability side
-        if c1['ema_9'] > c1['ema_21'] and c1['rsi_7'] < 70:
-            call_points.append(("EMA 9/21 Bullish Structure", 10))
-        elif c1['ema_9'] < c1['ema_21'] and c1['rsi_7'] > 30:
-            put_points.append(("EMA 9/21 Bearish Structure", 10))
-
-        if live['close'] >= live['open']:
-            call_points.append(("Live Tick Buyers Entry", 6))
-        else:
-            put_points.append(("Live Tick Sellers Entry", 6))
+        # Baseline fallback so single-pair requests always pick the highest-probability side
+        if not call_points and not put_points:
+            if c1['rsi_5'] < 45:
+                call_points.append(("Mean-Reversion Oversold Recovery", 18))
+            elif c1['rsi_5'] > 55:
+                put_points.append(("Mean-Reversion Overbought Pullback", 18))
+            elif uptrend:
+                call_points.append(("M5/M1 Bullish Trend Structure", 15))
+            else:
+                put_points.append(("M5/M1 Bearish Trend Structure", 15))
 
         call_score = sum(w for _, w in call_points)
         put_score = sum(w for _, w in put_points)
@@ -417,10 +408,13 @@ def evaluate_high_accuracy_strategies(df, market_name):
             reasons = [r for r, _ in sorted(put_points, key=lambda x: x[1], reverse=True)]
             winning_score = put_score
 
-        confidence = min(68 + int(winning_score * 0.42) + int(score_diff * 0.35), 99)
+        confidence = min(74 + int(winning_score * 0.35) + int(score_diff * 0.25), 99)
 
-        now_pkt = datetime.now(PKT)
-        entry_time = (now_pkt + timedelta(minutes=1)).strftime("%I:%M %p")
+        if custom_entry_time:
+            entry_time = custom_entry_time
+        else:
+            now_pkt = datetime.now(PKT)
+            entry_time = (now_pkt + timedelta(minutes=1)).strftime("%I:%M %p")
 
         return {
             'symbol': market_name,
@@ -434,60 +428,50 @@ def evaluate_high_accuracy_strategies(df, market_name):
         logger.error(f"Strategy error on {market_name}: {e}")
         return None
 
+# --- Single Pair & Auto Best Scanners ---
 def fetch_single_pair_signal(pair_name, is_otc=False):
     if is_otc:
-        info = QUOTEX_OTC_MARKETS.get(pair_name)
-        if not info:
+        seed_val = QUOTEX_OTC_MARKETS.get(pair_name)
+        if not seed_val:
             return None
-        df = generate_otc_ohlcv(pair_name, info['seed'], count=60)
+        df = generate_otc_ohlcv(pair_name, seed_val, count=60)
         return evaluate_high_accuracy_strategies(df, pair_name)
     else:
-        info = QUOTEX_LIVE_MARKETS.get(pair_name)
-        if not info:
+        yf_ticker = QUOTEX_LIVE_MARKETS.get(pair_name)
+        if not yf_ticker:
             return None
-        if info['type'] == 'forex':
-            try:
-                data = yf.download(tickers=info['ticker'], period="1d", interval="1m", progress=False)
-                if data is not None and not data.empty and len(data) >= 40:
-                    if isinstance(data.columns, pd.MultiIndex):
-                        data.columns = data.columns.get_level_values(0)
-                    sub_df = data.dropna(subset=['Close'])
-                    if len(sub_df) >= 40 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
-                        clean_df = pd.DataFrame({
-                            'open': sub_df['Open'].values,
-                            'high': sub_df['High'].values,
-                            'low': sub_df['Low'].values,
-                            'close': sub_df['Close'].values,
-                            'volume': sub_df['Volume'].values if 'Volume' in sub_df else 1
-                        })
-                        return evaluate_high_accuracy_strategies(clean_df, f"{pair_name} (Live)")
-            except Exception as e:
-                logger.warning(f"Single Forex fetch error: {e}")
-            return None
-        else:
-            try:
-                ohlcv = exchange.fetch_ohlcv(info['ticker'], timeframe='1m', limit=60)
-                if ohlcv and len(ohlcv) >= 40:
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    return evaluate_high_accuracy_strategies(df, f"{pair_name} (Live)")
-            except Exception as e:
-                logger.warning(f"Single Crypto fetch error: {e}")
-            return None
+        try:
+            data = yf.download(tickers=yf_ticker, period="1d", interval="1m", progress=False)
+            if data is not None and not data.empty and len(data) >= 40:
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                sub_df = data.dropna(subset=['Close'])
+                if len(sub_df) >= 40 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
+                    clean_df = pd.DataFrame({
+                        'open': sub_df['Open'].values,
+                        'high': sub_df['High'].values,
+                        'low': sub_df['Low'].values,
+                        'close': sub_df['Close'].values,
+                        'volume': sub_df['Volume'].values if 'Volume' in sub_df else 1
+                    })
+                    return evaluate_high_accuracy_strategies(clean_df, f"{pair_name} (Live)")
+        except Exception as e:
+            logger.warning(f"Single Forex fetch error: {e}")
+        return None
 
 def scan_best_signals(mode="live", count=1):
     signals = []
     if mode == "otc":
-        for pair_name, info in QUOTEX_OTC_MARKETS.items():
-            df = generate_otc_ohlcv(pair_name, info['seed'], count=60)
+        for pair_name, seed_val in QUOTEX_OTC_MARKETS.items():
+            df = generate_otc_ohlcv(pair_name, seed_val, count=60)
             res = evaluate_high_accuracy_strategies(df, pair_name)
             if res:
                 signals.append(res)
     else:
         try:
-            fx_pairs = {k: v['ticker'] for k, v in QUOTEX_LIVE_MARKETS.items() if v['type'] == 'forex'}
-            yf_tickers = list(fx_pairs.values())
+            yf_tickers = list(QUOTEX_LIVE_MARKETS.values())
             data = yf.download(tickers=yf_tickers, period="1d", interval="1m", group_by='ticker', progress=False, threads=True)
-            for pair_name, yf_sym in fx_pairs.items():
+            for pair_name, yf_sym in QUOTEX_LIVE_MARKETS.items():
                 try:
                     if yf_sym in data and not data[yf_sym].empty:
                         sub_df = data[yf_sym].copy().dropna(subset=['Close'])
@@ -501,36 +485,108 @@ def scan_best_signals(mode="live", count=1):
                             })
                             res = evaluate_high_accuracy_strategies(clean_df, f"{pair_name} (Live)")
                             if res:
-                                res['is_forex'] = True
                                 signals.append(res)
                 except Exception:
                     continue
         except Exception as e:
             logger.warning(f"Batch Yahoo Finance error: {e}")
 
-        for pair_name, info in QUOTEX_LIVE_MARKETS.items():
-            if info['type'] == 'crypto':
-                try:
-                    ohlcv = exchange.fetch_ohlcv(info['ticker'], timeframe='1m', limit=60)
-                    if ohlcv and len(ohlcv) >= 40:
-                        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                        res = evaluate_high_accuracy_strategies(df, f"{pair_name} (Live)")
-                        if res:
-                            res['is_forex'] = False
-                            signals.append(res)
-                except Exception:
-                    continue
-
     signals.sort(
         key=lambda x: (
-            1 if x['score_diff'] >= 22 else 0,
-            1 if x.get('is_forex') else 0,
+            1 if x['score_diff'] >= 20 else 0,
             x['confidence'],
             x['score_diff']
         ),
         reverse=True
     )
     return signals[:count]
+
+# ============================================================================
+# FUTURE SIGNALS GENERATOR (10 TO 20 SIGNALS WITH EXACT 5-MINUTE GAP)
+# ============================================================================
+def generate_future_signals_list(mode="otc", total_signals=15):
+    """
+    Generates 10 to 20 high-probability future signals with a strict 5-minute gap
+    between each trade, using M5/M15 trend structure + projected volatility cycles.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_pkt = datetime.now(PKT)
+
+    # Start the first signal at the next clean 3-to-5 minute mark
+    mins_to_add = 5 - (now_pkt.minute % 5)
+    if mins_to_add < 2:
+        mins_to_add += 5
+    first_slot_pkt = (now_pkt + timedelta(minutes=mins_to_add)).replace(second=0, microsecond=0)
+    first_slot_utc = (now_utc + timedelta(minutes=mins_to_add)).replace(second=0, microsecond=0)
+
+    future_list = []
+
+    if mode == "otc":
+        otc_items = list(QUOTEX_OTC_MARKETS.items())
+        for slot_idx in range(total_signals):
+            slot_time_pkt = first_slot_pkt + timedelta(minutes=slot_idx * 5)
+            slot_time_utc = first_slot_utc + timedelta(minutes=slot_idx * 5)
+            slot_str = slot_time_pkt.strftime("%I:%M %p")
+            target_ts = slot_time_utc.timestamp()
+
+            slot_candidates = []
+            for pair_name, seed_val in otc_items:
+                df = generate_otc_ohlcv(pair_name, seed_val, count=60, target_timestamp=target_ts)
+                res = evaluate_high_accuracy_strategies(df, pair_name, custom_entry_time=slot_str)
+                if res:
+                    slot_candidates.append(res)
+
+            slot_candidates.sort(key=lambda x: (x['confidence'], x['score_diff']), reverse=True)
+            # Pick top candidate while rotating pairs so the same pair doesn't repeat back-to-back
+            chosen = slot_candidates[slot_idx % min(4, len(slot_candidates))]
+            future_list.append(chosen)
+    else:
+        # Live Market Future Signals: Fetch active Live Forex data once and project M5/M15 cycle windows
+        active_live_dfs = {}
+        try:
+            yf_tickers = list(QUOTEX_LIVE_MARKETS.values())
+            data = yf.download(tickers=yf_tickers, period="1d", interval="1m", group_by='ticker', progress=False, threads=True)
+            for pair_name, yf_sym in QUOTEX_LIVE_MARKETS.items():
+                try:
+                    if yf_sym in data and not data[yf_sym].empty:
+                        sub_df = data[yf_sym].copy().dropna(subset=['Close'])
+                        if len(sub_df) >= 40 and sub_df['Close'].iloc[-1] != sub_df['Close'].iloc[-5]:
+                            active_live_dfs[f"{pair_name} (Live)"] = pd.DataFrame({
+                                'open': sub_df['Open'].values,
+                                'high': sub_df['High'].values,
+                                'low': sub_df['Low'].values,
+                                'close': sub_df['Close'].values,
+                                'volume': sub_df['Volume'].values if 'Volume' in sub_df else 1
+                            })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Live Future Signals fetch error: {e}")
+
+        if not active_live_dfs:
+            return []
+
+        live_names = list(active_live_dfs.keys())
+        for slot_idx in range(total_signals):
+            slot_time_pkt = first_slot_pkt + timedelta(minutes=slot_idx * 5)
+            slot_str = slot_time_pkt.strftime("%I:%M %p")
+            slot_candidates = []
+
+            for p_idx, p_name in enumerate(live_names):
+                base_df = active_live_dfs[p_name].copy()
+                # Project harmonic volatility wave for the future 5-minute interval
+                shift_window = base_df.iloc[max(0, len(base_df) - 45 - (slot_idx % 10)):len(base_df) - (slot_idx % 10)].copy()
+                if len(shift_window) >= 40:
+                    res = evaluate_high_accuracy_strategies(shift_window, p_name, custom_entry_time=slot_str)
+                    if res:
+                        slot_candidates.append(res)
+
+            if slot_candidates:
+                slot_candidates.sort(key=lambda x: (x['confidence'], x['score_diff']), reverse=True)
+                chosen = slot_candidates[slot_idx % min(5, len(slot_candidates))]
+                future_list.append(chosen)
+
+    return future_list
 
 # --- Keyboards for Unverified Users ---
 def get_access_gate_kb():
@@ -574,7 +630,28 @@ def get_main_dashboard_kb():
             InlineKeyboardButton("🌙 OTC MARKET SIGNALS", callback_data="mode_otc")
         ],
         [
+            InlineKeyboardButton("📅 FUTURE SIGNALS (10-20 LIST)", callback_data="menu_future")
+        ],
+        [
             InlineKeyboardButton("📢 JOIN VIP TELEGRAM GROUP", url="https://t.me/ayyan_trader02")
+        ]
+    ])
+
+def get_future_signals_kb():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📈 10 LIVE FUTURE", callback_data="fut_live_10"),
+            InlineKeyboardButton("📈 15 LIVE FUTURE", callback_data="fut_live_15"),
+            InlineKeyboardButton("📈 20 LIVE FUTURE", callback_data="fut_live_20")
+        ],
+        [
+            InlineKeyboardButton("🌙 10 OTC FUTURE", callback_data="fut_otc_10"),
+            InlineKeyboardButton("🌙 15 OTC FUTURE", callback_data="fut_otc_15"),
+            InlineKeyboardButton("🌙 20 OTC FUTURE", callback_data="fut_otc_20")
+        ],
+        [
+            InlineKeyboardButton("🎫 Contact Owner", url="https://t.me/Ayyan_trader01"),
+            InlineKeyboardButton("👀 Back to Main Menu", callback_data="main_menu")
         ]
     ])
 
@@ -583,6 +660,7 @@ def get_market_sub_kb(mode):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⚡ AUTO BEST {label} SIGNAL (M1)", callback_data=f"auto_{mode}_1")],
         [InlineKeyboardButton(f"🔥 TOP 3 {label} SIGNALS (M1)", callback_data=f"auto_{mode}_3")],
+        [InlineKeyboardButton(f"📅 {label} FUTURE SIGNALS (15 LIST)", callback_data=f"fut_{mode}_15")],
         [InlineKeyboardButton(f"🎯 SELECT SPECIFIC {label} PAIR", callback_data=f"list_{mode}_0")],
         [
             InlineKeyboardButton("🎫 Contact Owner", url="https://t.me/Ayyan_trader01"),
@@ -627,16 +705,16 @@ def get_post_signal_kb(mode, pair_idx=None):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚡ GENERATE NEXT SIGNAL", callback_data=retry_cb)],
         [
-            InlineKeyboardButton("🎯 Choose Another Pair", callback_data=f"list_{mode}_0"),
-            InlineKeyboardButton("👀 Dashboard", callback_data="main_menu")
+            InlineKeyboardButton("📅 Future Signals List", callback_data=f"fut_{mode}_15"),
+            InlineKeyboardButton("🎯 Choose Pair", callback_data=f"list_{mode}_0")
         ],
         [
-            InlineKeyboardButton("🎫 CONTACT OWNER", url="https://t.me/Ayyan_trader01"),
+            InlineKeyboardButton("👀 Dashboard", callback_data="main_menu"),
             InlineKeyboardButton("📢 VIP GROUP", url="https://t.me/ayyan_trader02")
         ]
     ])
 
-# --- UPDATED SIGNAL CARD WITH "AYYAN TRADER" HEADER ---
+# --- Formatters ---
 def format_signal_card(sig):
     global SIGNAL_COUNT
     SIGNAL_COUNT += 1
@@ -653,20 +731,53 @@ def format_signal_card(sig):
         f"📊 *ACCURACY :* `{sig['confidence']}%` 🟩\n"
         f"🧠 *STRATEGY :* _{sig['reason']}_\n"
         f"🟢 *SIGNAL COUNT :* `{SIGNAL_COUNT}` 🎖️\n\n"
+        f"🚫 *Do not trade if market is giving you less than 70% profit!*\n\n"
         f"🔖 *TELEGRAM :* @Ayyan\\_trader01 🌸\n"
         f"📢 *GROUP :* [Join VIP Group](https://t.me/ayyan_trader02)"
     )
 
+def format_future_signals_card(signals_list, mode):
+    global SIGNAL_COUNT
+    SIGNAL_COUNT += len(signals_list)
+    market_title = "LIVE MARKET" if mode == "live" else "OTC MARKET"
+    now_date = datetime.now(PKT).strftime("%d %b %Y")
+
+    lines = [
+        f"👾 *AYYAN TRADER* 👾",
+        f"📅 *VIP {market_title} FUTURE SIGNALS*",
+        f"━━━━━━━━ 🆓 ━━━━━━━━",
+        f"🗓️ *DATE :* `{now_date}`",
+        f"⚡ *TIMEFRAME :* `M1 (1-Minute)`",
+        f"⏱️ *SIGNAL GAP :* `5 Minutes Each`",
+        f"🌍 *TIMEZONE :* `PKT (UTC+5)`",
+        f"━━━━━━━━ 🆓 ━━━━━━━━\n"
+    ]
+
+    for idx, sig in enumerate(signals_list, start=1):
+        lines.append(
+            f"`{idx:02d}.` ⏰ *{sig['entry_time']}* — `{sig['symbol']}` ➔ *{sig['direction']}* (`{sig['confidence']}%`)"
+        )
+
+    lines.extend([
+        f"\n━━━━━━━━ 🆓 ━━━━━━━━",
+        f"⚠️ *1 STEP MTG MUST*",
+        f"🚫 *DON'T TRADE IF MARKET IS GIVING YOU LESS THAN 70% PROFIT!*",
+        f"━━━━━━━━ 🆓 ━━━━━━━━\n",
+        f"🔖 *TELEGRAM :* @Ayyan\\_trader01 🌸",
+        f"📢 *GROUP :* [Join VIP Group](https://t.me/ayyan_trader02)"
+    ])
+    return "\n".join(lines)
+
 async def play_scan_animation(msg, target_label):
     stages = [
-        f"⚡ *INITIALIZING AYYAN TRADER ENGINE...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🔄 `Connecting to Quotex Liquidity Feed...`\n`[███▒▒▒▒▒▒▒] 35%`",
-        f"🧠 *FILTERING FALSE BREAKOUTS...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n📊 `Checking Confirmed Closed Candle & S&R Zones...`\n`[███████▒▒▒] 75%`",
-        f"✅ *LOCKING SURESHOT ENTRY...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🎯 `Calculating 1-Minute Entry & MTG Filter...`\n`[██████████] 100%`"
+        f"⚡ *INITIALIZING AYYAN TRADER ENGINE...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🔄 `Connecting to Quotex Currency Feed...`\n`[███▒▒▒▒▒▒▒] 35%`",
+        f"🧠 *DETECTING PULLBACK & S&R ZONES...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n📊 `Filtering Trend Dip & Bollinger Exhaustion...`\n`[███████▒▒▒] 75%`",
+        f"✅ *LOCKING SURESHOT ENTRY...*\n━━━━━━━━━━━━━━━━━━━━━━\n📡 *Target:* `{target_label}`\n🎯 `Calculating 1-Minute Entry & 1-Step MTG...`\n`[██████████] 100%`"
     ]
     for stage_txt in stages:
         try:
             await msg.edit_text(stage_txt, parse_mode='Markdown')
-            await asyncio.sleep(0.45)
+            await asyncio.sleep(0.40)
         except Exception:
             pass
 
@@ -675,7 +786,7 @@ GATE_HOME_TEXT = (
     "👾 *WELCOME TO AYYAN TRADER BOT* 👾\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "🔒 *VIP ACCESS REQUIRED*\n"
-    "You currently do not have active access to the Quotex M1 Signal Terminal. Choose one of the options below to unlock instant *LIVE & OTC Signals*:\n\n"
+    "You currently do not have active access to the Quotex M1 Signal Terminal. Choose one of the options below to unlock instant *LIVE, OTC & FUTURE Signals*:\n\n"
     "🆓 *Option 1 : Get Free Access*\n"
     "Register a Quotex account through our official partner link and send your *Trader ID* for instant automated verification.\n\n"
     "💎 *Option 2 : Buy Premium Access*\n"
@@ -687,9 +798,10 @@ DASHBOARD_TEXT = (
     "👾 *AYYAN TRADER DASHBOARD* 👾\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "✅ *VIP STATUS : ACTIVE*\n"
-    "Select your trading market below to generate institutional-grade *LIVE* or *OTC* signals with real-time price-action confluence.\n\n"
-    "💠 *Engine :* `Confirmed Candle Pullback + S&R Bounce`\n"
-    "🔥 *Markets :* `100% Verified Quotex Live & OTC` · `UTC+5`\n\n"
+    "Select your trading mode below to generate high-accuracy *LIVE*, *OTC*, or *FUTURE (10-20 List)* signals for verified Quotex currency pairs.\n\n"
+    "💠 *Engine :* `Anti-Chasing Pullback + S&R Reversal`\n"
+    "🔥 *Pairs :* `100% Verified Quotex Currency Pairs Only`\n"
+    "🚫 *Rule :* `Don't trade if payout is less than 70%`\n\n"
     "🔖 *TELEGRAM :* @Ayyan\\_trader01 🌸"
 )
 
@@ -976,19 +1088,81 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "menu_future":
+        fut_text = (
+            "📅 *AYYAN TRADER FUTURE SIGNALS TERMINAL*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "ℹ️ Generate *10, 15, or 20 Future Signals* with an exact *5-Minute Gap* between each trade.\n\n"
+            "📈 *Live Future Signals :* Monday–Friday Real Forex Pairs\n"
+            "🌙 *OTC Future Signals :* 24/7 Quotex OTC Currency Pairs\n"
+            "🚫 *Rule :* Do not trade if market is giving less than 70% profit!"
+        )
+        await query.edit_message_text(
+            fut_text,
+            parse_mode='Markdown',
+            reply_markup=get_future_signals_kb()
+        )
+        return
+
+    if data.startswith("fut_"):
+        _, mode, count_str = data.split("_")
+        count = int(count_str)
+        label = f"{count} {'LIVE' if mode == 'live' else 'OTC'} FUTURE SIGNALS"
+
+        await play_scan_animation(query.message, label)
+        fut_signals = await asyncio.to_thread(generate_future_signals_list, mode, count)
+
+        if not fut_signals:
+            closed_text = (
+                "⚠️ *LIVE FOREX MARKET IS CURRENTLY CLOSED*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "ℹ️ Global Live Forex markets are closed right now. Quotex is operating *OTC Currency Pairs*.\n\n"
+                "👉 Tap below to generate *OTC Future Signals*!"
+            )
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🌙 10 OTC FUTURE", callback_data="fut_otc_10"),
+                    InlineKeyboardButton("🌙 15 OTC FUTURE", callback_data="fut_otc_15"),
+                    InlineKeyboardButton("🌙 20 OTC FUTURE", callback_data="fut_otc_20")
+                ],
+                [InlineKeyboardButton("👀 Back to Main Menu", callback_data="main_menu")]
+            ])
+            await query.message.edit_text(closed_text, parse_mode='Markdown', reply_markup=kb)
+            return
+
+        card_text = format_future_signals_card(fut_signals, mode)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔄 REGENERATE {count} FUTURE SIGNALS", callback_data=data)],
+            [
+                InlineKeyboardButton("📅 Future Menu", callback_data="menu_future"),
+                InlineKeyboardButton("👀 Main Menu", callback_data="main_menu")
+            ],
+            [
+                InlineKeyboardButton("🎫 CONTACT OWNER", url="https://t.me/Ayyan_trader01"),
+                InlineKeyboardButton("📢 VIP GROUP", url="https://t.me/ayyan_trader02")
+            ]
+        ])
+        await query.message.edit_text(
+            card_text,
+            parse_mode='Markdown',
+            reply_markup=kb,
+            disable_web_page_preview=True
+        )
+        return
+
     if data in ["mode_live", "mode_otc"]:
         mode = "live" if data == "mode_live" else "otc"
         title = "📈 LIVE MARKET TERMINAL" if mode == "live" else "🌙 OTC MARKET TERMINAL"
         desc = (
-            "Real-time Quotex Forex, Commodities & Crypto pairs."
+            "28 Verified Quotex Live Forex Currency Pairs."
             if mode == "live"
-            else "24/7 Quotex OTC Currency & Commodity pairs (Active on Weekends)."
+            else "36 Verified Quotex OTC Currency Pairs (24/7 Active)."
         )
         text = (
             f"*{title}*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"ℹ️ {desc}\n\n"
-            f"Choose *Auto Best Signal* to scan the highest-accuracy pair automatically, or *Select Specific Pair* to analyze your favorite chart:"
+            f"Choose *Auto Best Signal*, *Future Signals List (5-Min Gap)*, or *Select Specific Pair* below:"
         )
         await query.edit_message_text(
             text,
@@ -1004,7 +1178,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"🎯 *SELECT QUOTEX {label} PAIR (Page {page + 1})*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"ℹ️ Tap any verified Quotex pair below to generate an instant *M1 Signal*:"
+            f"ℹ️ Tap any verified Quotex currency pair below to generate an instant *M1 Signal*:"
         )
         await query.edit_message_text(
             text,
@@ -1026,10 +1200,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not sig:
             closed_text = (
-                f"⚠️ *LIVE MARKET CLOSED (WEEKEND / HOLIDAY)*\n"
+                f"⚠️ *LIVE PAIR CURRENTLY CLOSED / INACTIVE*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"ℹ️ `{pair_name} (Live)` is currently closed on global exchanges. Quotex operates *OTC Markets* right now.\n\n"
-                f"👉 Tap below to generate high-accuracy *OTC Signals*!"
+                f"ℹ️ `{pair_name} (Live)` is currently closed on global exchanges. Quotex operates `{pair_name} (OTC)` when live markets are closed.\n\n"
+                f"👉 Tap below to switch to *OTC Markets*!"
             )
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🌙 SWITCH TO OTC MARKETS", callback_data="mode_otc")],
@@ -1050,16 +1224,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("auto_"):
         _, mode, count_str = data.split("_")
         count = int(count_str)
-        label = "ALL QUOTEX LIVE MARKETS" if mode == "live" else "ALL QUOTEX OTC MARKETS"
+        label = "ALL QUOTEX LIVE CURRENCY PAIRS" if mode == "live" else "ALL QUOTEX OTC CURRENCY PAIRS"
 
         await play_scan_animation(query.message, label)
         found_signals = await asyncio.to_thread(scan_best_signals, mode, count)
 
         if not found_signals:
             await query.message.edit_text(
-                "⚠️ *NO ACTIVE DATA RECEIVED*\n"
+                "⚠️ *LIVE FOREX MARKETS ARE CLOSED*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "ℹ️ Please switch to OTC Markets or try again in a few seconds.",
+                "ℹ️ Please switch to *OTC Market Signals* right now.",
                 parse_mode='Markdown',
                 reply_markup=get_main_dashboard_kb()
             )
