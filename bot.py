@@ -238,6 +238,19 @@ QUOTEX_OTC_MARKETS = {
     "USD/ZAR (OTC)": 214,
 }
 
+# ============================================================================
+# STRICT 7 OTC PAIRS FOR FUTURE OTC SIGNALS LIST ONLY
+# ============================================================================
+FUTURE_OTC_7_MARKETS = {
+    "USD/PKR (OTC)": 201,
+    "USD/BRL (OTC)": 203,
+    "USD/MXN (OTC)": 208,
+    "USD/NGN (OTC)": 209,
+    "USD/IDR (OTC)": 207,
+    "USD/EGP (OTC)": 205,
+    "NZD/USD (OTC)": 107,
+}
+
 # --- OTC Candle Series Generator ---
 def generate_otc_ohlcv(pair_name, seed_val, count=60, target_timestamp=None):
     if target_timestamp is None:
@@ -493,7 +506,7 @@ def scan_best_signals(mode="live", count=1):
     return signals[:count]
 
 # --- Future Signals Generator ---
-def generate_future_signals_list(mode="otc", total_signals=15):
+def generate_future_signals_list(mode="otc", total_signals=7):
     now_utc = datetime.now(timezone.utc)
     now_pkt = datetime.now(PKT)
 
@@ -506,23 +519,18 @@ def generate_future_signals_list(mode="otc", total_signals=15):
     future_list = []
 
     if mode == "otc":
-        otc_items = list(QUOTEX_OTC_MARKETS.items())
-        for slot_idx in range(total_signals):
+        # Strictly generate 1 signal for each of the 7 specified OTC pairs
+        otc_items = list(FUTURE_OTC_7_MARKETS.items())
+        for slot_idx, (pair_name, seed_val) in enumerate(otc_items):
             slot_time_pkt = first_slot_pkt + timedelta(minutes=slot_idx * 5)
             slot_time_utc = first_slot_utc + timedelta(minutes=slot_idx * 5)
             slot_str = slot_time_pkt.strftime("%I:%M %p")
             target_ts = slot_time_utc.timestamp()
 
-            slot_candidates = []
-            for pair_name, seed_val in otc_items:
-                df = generate_otc_ohlcv(pair_name, seed_val, count=60, target_timestamp=target_ts)
-                res = evaluate_high_accuracy_strategies(df, pair_name, custom_entry_time=slot_str)
-                if res:
-                    slot_candidates.append(res)
-
-            slot_candidates.sort(key=lambda x: (x['confidence'], x['score_diff']), reverse=True)
-            chosen = slot_candidates[slot_idx % min(4, len(slot_candidates))]
-            future_list.append(chosen)
+            df = generate_otc_ohlcv(pair_name, seed_val, count=60, target_timestamp=target_ts)
+            res = evaluate_high_accuracy_strategies(df, pair_name, custom_entry_time=slot_str)
+            if res:
+                future_list.append(res)
     else:
         active_live_dfs = {}
         try:
@@ -648,7 +656,7 @@ def get_main_dashboard_kb(user=None):
                 InlineKeyboardButton("📈 LIVE MARKET SIGNALS", callback_data="mode_live"),
                 InlineKeyboardButton("🌙 OTC MARKET SIGNALS", callback_data="mode_otc")
             ],
-            [InlineKeyboardButton("📅 FUTURE SIGNALS (10-20 LIST)", callback_data="menu_future")],
+            [InlineKeyboardButton("📅 FUTURE SIGNALS", callback_data="menu_future")],
             [
                 InlineKeyboardButton(f"👥 Approved Users ({vip_cnt})", callback_data="admin_users_list"),
                 InlineKeyboardButton("👁️ Preview User Menu", callback_data="gate_home")
@@ -662,7 +670,7 @@ def get_main_dashboard_kb(user=None):
             InlineKeyboardButton("🌙 OTC MARKET SIGNALS", callback_data="mode_otc")
         ],
         [
-            InlineKeyboardButton("📅 FUTURE SIGNALS (10-20 LIST)", callback_data="menu_future")
+            InlineKeyboardButton("📅 FUTURE SIGNALS", callback_data="menu_future")
         ],
         [
             InlineKeyboardButton("📢 Join Group", url=GROUP_LINK),
@@ -678,9 +686,7 @@ def get_future_signals_kb():
             InlineKeyboardButton("📈 20 LIVE FUTURE", callback_data="fut_live_20")
         ],
         [
-            InlineKeyboardButton("🌙 10 OTC FUTURE", callback_data="fut_otc_10"),
-            InlineKeyboardButton("🌙 15 OTC FUTURE", callback_data="fut_otc_15"),
-            InlineKeyboardButton("🌙 20 OTC FUTURE", callback_data="fut_otc_20")
+            InlineKeyboardButton("🌙 7 OTC FUTURE SIGNALS", callback_data="fut_otc_7")
         ],
         [
             InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="main_menu")
@@ -689,10 +695,12 @@ def get_future_signals_kb():
 
 def get_market_sub_kb(mode):
     label = "LIVE" if mode == "live" else "OTC"
+    fut_btn_text = "📅 LIVE FUTURE SIGNALS (15 LIST)" if mode == "live" else "🌙 7 OTC FUTURE SIGNALS"
+    fut_cb_data = "fut_live_15" if mode == "live" else "fut_otc_7"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⚡ AUTO BEST {label} SIGNAL (M1)", callback_data=f"auto_{mode}_1")],
         [InlineKeyboardButton(f"🔥 TOP 3 {label} SIGNALS (M1)", callback_data=f"auto_{mode}_3")],
-        [InlineKeyboardButton(f"📅 {label} FUTURE SIGNALS (15 LIST)", callback_data=f"fut_{mode}_15")],
+        [InlineKeyboardButton(fut_btn_text, callback_data=fut_cb_data)],
         [InlineKeyboardButton(f"🎯 SELECT SPECIFIC {label} PAIR", callback_data=f"list_{mode}_0")],
         [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="main_menu")]
     ])
@@ -731,10 +739,12 @@ def get_pairs_grid_kb(mode, page=0):
 
 def get_post_signal_kb(mode, pair_idx=None):
     retry_cb = f"pair_{mode}_{pair_idx}" if pair_idx is not None else f"auto_{mode}_1"
+    fut_cb = "fut_live_15" if mode == "live" else "fut_otc_7"
+    fut_label = "📅 Future Signals List" if mode == "live" else "🌙 7 OTC Future Signals"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚡ GENERATE NEXT SIGNAL", callback_data=retry_cb)],
         [
-            InlineKeyboardButton("📅 Future Signals List", callback_data=f"fut_{mode}_15"),
+            InlineKeyboardButton(fut_label, callback_data=fut_cb),
             InlineKeyboardButton("🎯 Choose Pair", callback_data=f"list_{mode}_0")
         ],
         [
@@ -840,7 +850,7 @@ def get_dashboard_text(user) -> str:
         "👾 *AYYAN TRADER VIP DASHBOARD* 👾\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "✅ *VIP STATUS : ACTIVE (UNLIMITED ACCESS)*\n"
-        "Select your trading mode below to generate high-accuracy *LIVE*, *OTC*, or *FUTURE (10-20 List)* signals for verified Quotex currency pairs.\n\n"
+        "Select your trading mode below to generate high-accuracy *LIVE*, *OTC*, or *FUTURE* signals for verified Quotex currency pairs.\n\n"
         "💠 *Engine :* `Anti-Chasing Pullback + S&R Reversal`\n"
         "🔥 *Pairs :* `100% Verified Quotex Currency Pairs Only`\n"
         "🚫 *Rule :* `Don't trade if payout is less than 70%`\n\n"
@@ -1491,9 +1501,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fut_text = (
             "📅 *AYYAN TRADER FUTURE SIGNALS TERMINAL*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "ℹ️ Generate *10, 15, or 20 Future Signals* with an exact *5-Minute Gap* between each trade.\n\n"
+            "ℹ️ Generate *Future Signals* with an exact *5-Minute Gap* between each trade.\n\n"
             "📈 *Live Future Signals :* Monday–Friday Real Forex Pairs\n"
-            "🌙 *OTC Future Signals :* 24/7 Quotex OTC Currency Pairs\n"
+            "🌙 *7 OTC Future Signals :* USD/PKR, USD/BRL, USD/MXN, USD/NGN, USD/IDR, USD/EGP, NZD/USD (OTC)\n"
             "🚫 *Rule :* Do not trade if market is giving less than 70% profit!"
         )
         await query.edit_message_text(
@@ -1505,7 +1515,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("fut_"):
         _, mode, count_str = data.split("_")
-        count = int(count_str)
+        count = 7 if mode == "otc" else int(count_str)
         label = f"{count} {'LIVE' if mode == 'live' else 'OTC'} FUTURE SIGNALS"
 
         await play_scan_animation(query.message, label)
@@ -1516,22 +1526,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ *LIVE FOREX MARKET IS CURRENTLY CLOSED*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "ℹ️ Global Live Forex markets are closed right now. Quotex is operating *OTC Currency Pairs*.\n\n"
-                "👉 Tap below to generate *OTC Future Signals*!"
+                "👉 Tap below to generate *7 OTC Future Signals*!"
             )
             kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🌙 10 OTC FUTURE", callback_data="fut_otc_10"),
-                    InlineKeyboardButton("🌙 15 OTC FUTURE", callback_data="fut_otc_15"),
-                    InlineKeyboardButton("🌙 20 OTC FUTURE", callback_data="fut_otc_20")
-                ],
+                [InlineKeyboardButton("🌙 7 OTC FUTURE SIGNALS", callback_data="fut_otc_7")],
                 [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="main_menu")]
             ])
             await query.message.edit_text(closed_text, parse_mode='Markdown', reply_markup=kb)
             return
 
         card_text = format_future_signals_card(fut_signals, mode)
+        regen_label = "🔄 REGENERATE 7 OTC FUTURE SIGNALS" if mode == "otc" else f"🔄 REGENERATE {count} FUTURE SIGNALS"
+        regen_cb = "fut_otc_7" if mode == "otc" else data
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🔄 REGENERATE {count} FUTURE SIGNALS", callback_data=data)],
+            [InlineKeyboardButton(regen_label, callback_data=regen_cb)],
             [
                 InlineKeyboardButton("📅 Future Menu", callback_data="menu_future"),
                 InlineKeyboardButton("⬅️ Dashboard", callback_data="main_menu")
