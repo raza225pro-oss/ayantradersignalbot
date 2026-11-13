@@ -1670,6 +1670,3 @@ if __name__ == "__main__":
     flask_thread.start()
 
     run_bot()
-
-
-is me se ayyan wali identity khtm kr do overall or join group wali bi bs name is ka rkh dena HamzaTrader kr k bs or khrab na krna kuch bi is me se
