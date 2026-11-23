@@ -1810,8 +1810,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 def run_bot():
+    if not TOKEN or not str(TOKEN).strip():
+        logger.error("=" * 60)
+        logger.error("❌ CRITICAL ERROR: BOT_TOKEN is missing or empty!")
+        logger.error("👉 Please add 'BOT_TOKEN' in Railway Dashboard -> Variables tab.")
+        logger.error("👉 Get your token from Telegram @BotFather.")
+        logger.error("=" * 60)
+        import time
+        while True:
+            time.sleep(3600)
+
     logger.info("Starting Ayyan Trader Quotex Telegram Bot...")
-    telegram_app = Application.builder().token(TOKEN).build()
+    try:
+        telegram_app = Application.builder().token(TOKEN.strip()).build()
+    except Exception as e:
+        logger.error("=" * 60)
+        logger.error(f"❌ INVALID BOT_TOKEN ERROR: {e}")
+        logger.error("👉 Make sure you copied the full valid token from @BotFather!")
+        logger.error("=" * 60)
+        import time
+        while True:
+            time.sleep(3600)
 
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("admin", admin_command))
