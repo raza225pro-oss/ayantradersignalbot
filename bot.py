@@ -43,7 +43,32 @@ def run_flask():
     app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # --- Configuration & Branding ---
-TOKEN = os.getenv("BOT_TOKEN")
+def resolve_bot_token():
+    candidates = ["BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN", "TG_TOKEN"]
+    raw_val = ""
+    for c in candidates:
+        val = os.getenv(c)
+        if val and val.strip():
+            raw_val = val.strip()
+            break
+    if not raw_val:
+        for k, v in os.environ.items():
+            if any(c == k.strip().upper() for c in candidates):
+                if v and v.strip():
+                    raw_val = v.strip()
+                    break
+
+    if not raw_val:
+        return ""
+
+    raw_val = raw_val.strip().strip('"').strip("'")
+    # Auto-extract token if user pasted extra text or quotes
+    match = re.search(r'(\d{8,12}:[A-Za-z0-9_-]+)', raw_val)
+    if match:
+        return match.group(1)
+    return raw_val
+
+TOKEN = resolve_bot_token()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) if os.getenv("ADMIN_ID", "").strip().isdigit() else 0
 raw_ids = os.getenv("ALLOWED_IDS", "")
 ENV_ALLOWED_IDS = set(int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit())
@@ -1810,22 +1835,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 def run_bot():
-    if not TOKEN or not str(TOKEN).strip():
+    token = resolve_bot_token()
+    if not token:
         logger.error("=" * 60)
         logger.error("❌ CRITICAL ERROR: BOT_TOKEN is missing or empty!")
+        logger.error(f"👉 Current Environment Keys found: {[k for k in os.environ.keys() if not k.startswith('_')]}")
         logger.error("👉 Please add 'BOT_TOKEN' in Railway Dashboard -> Variables tab.")
-        logger.error("👉 Get your token from Telegram @BotFather.")
         logger.error("=" * 60)
         import time
         while True:
             time.sleep(3600)
 
-    logger.info("Starting Ayyan Trader Quotex Telegram Bot...")
+    logger.info(f"Starting Ayyan Trader Quotex Telegram Bot (Token length: {len(token)})...")
     try:
-        telegram_app = Application.builder().token(TOKEN.strip()).build()
+        telegram_app = Application.builder().token(token).build()
     except Exception as e:
         logger.error("=" * 60)
         logger.error(f"❌ INVALID BOT_TOKEN ERROR: {e}")
+        logger.error(f"👉 Token preview: '{token[:4]}...{token[-4:]}' (length: {len(token)})")
         logger.error("👉 Make sure you copied the full valid token from @BotFather!")
         logger.error("=" * 60)
         import time
