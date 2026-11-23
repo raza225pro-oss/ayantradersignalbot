@@ -32,7 +32,18 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Ayyan Trader Quotex Bot is running!"
+    token = resolve_bot_token()
+    token_status = f"✅ Configured (Length: {len(token)})" if token else "❌ NOT CONFIGURED / MISSING"
+    return f"""
+    <html>
+      <body style='font-family: Arial, sans-serif; padding: 30px;'>
+        <h2>Ayyan Trader Quotex Bot Status</h2>
+        <p><b>Web Server:</b> Running on Railway</p>
+        <p><b>BOT_TOKEN Status:</b> {token_status}</p>
+        <p><i>If BOT_TOKEN shows missing, please add it in Railway Dashboard &gt; Variables tab!</i></p>
+      </body>
+    </html>
+    """
 
 @app.route('/health')
 def health():
@@ -1042,23 +1053,36 @@ async def render_admin_requests_view(query, req_type: str, index: int = 0):
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
     user = update.effective_user
+    logger.info(f"📨 Received /start from User {user.id} (@{user.username or 'no_user'})")
     context.user_data.clear()
 
-    if is_user_authorized(user):
-        await update.message.reply_text(
-            get_dashboard_text(user),
-            parse_mode='Markdown',
-            reply_markup=get_main_dashboard_kb(user),
-            disable_web_page_preview=True
-        )
-    else:
-        await update.message.reply_text(
-            GATE_HOME_TEXT,
-            parse_mode='Markdown',
-            reply_markup=get_access_gate_kb(False),
-            disable_web_page_preview=True
-        )
+    try:
+        if is_user_authorized(user):
+            await update.message.reply_text(
+                get_dashboard_text(user),
+                parse_mode='Markdown',
+                reply_markup=get_main_dashboard_kb(user),
+                disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(
+                GATE_HOME_TEXT,
+                parse_mode='Markdown',
+                reply_markup=get_access_gate_kb(False),
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.error(f"Error in /start markdown send: {e}")
+        try:
+            text = get_dashboard_text(user) if is_user_authorized(user) else GATE_HOME_TEXT
+            clean_text = text.replace('*', '').replace('_', '').replace('`', '')
+            kb = get_main_dashboard_kb(user) if is_user_authorized(user) else get_access_gate_kb(False)
+            await update.message.reply_text(clean_text, reply_markup=kb, disable_web_page_preview=True)
+        except Exception as e2:
+            logger.error(f"Fallback plain text send failed: {e2}")
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1834,6 +1858,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
+async def post_init_hook(app: Application):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Any existing Telegram webhooks cleared. Polling mode enabled.")
+    except Exception as e:
+        logger.warning(f"delete_webhook note: {e}")
+
+    try:
+        me = await app.bot.get_me()
+        logger.info("=" * 60)
+        logger.info("🚀 BOT IS ONLINE AND LISTENING!")
+        logger.info(f"🤖 Bot Username : @{me.username}")
+        logger.info(f"🆔 Bot ID       : {me.id}")
+        logger.info(f"👤 Bot Name     : {me.first_name}")
+        logger.info(f"👉 Open Telegram and send /start to @{me.username}!")
+        logger.info("=" * 60)
+    except Exception as e:
+        logger.error(f"Failed to fetch bot identity: {e}")
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"⚠️ Telegram Handler Exception: {context.error}")
+
 def run_bot():
     token = resolve_bot_token()
     if not token:
@@ -1848,7 +1894,12 @@ def run_bot():
 
     logger.info(f"Starting Ayyan Trader Quotex Telegram Bot (Token length: {len(token)})...")
     try:
-        telegram_app = Application.builder().token(token).build()
+        telegram_app = (
+            Application.builder()
+            .token(token)
+            .post_init(post_init_hook)
+            .build()
+        )
     except Exception as e:
         logger.error("=" * 60)
         logger.error(f"❌ INVALID BOT_TOKEN ERROR: {e}")
@@ -1859,6 +1910,7 @@ def run_bot():
         while True:
             time.sleep(3600)
 
+    telegram_app.add_error_handler(telegram_error_handler)
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("admin", admin_command))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
