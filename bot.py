@@ -1608,13 +1608,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- Callback Query Handler ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
     user = query.from_user
     user_id = user.id
     is_adm = check_and_register_admin(user)
     username_display = f"@{user.username}" if user.username else "No Username"
     full_name_display = user.full_name or "User"
+
+    # Answer the query immediately EXCEPT for demo_check_joined which uses show_alert
+    if data != "demo_check_joined":
+        await query.answer()
 
     # =========================================================================
     # 1. PUBLIC / UNAPPROVED USER FLOWS (HOME, DEMO, PAID, FREE ACCESS)
@@ -1652,7 +1655,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "demo_check_joined":
         joined = await check_user_in_group(context.bot, user_id)
         if not joined:
-            await query.answer("❌ Membership not detected! Please join the group first.", show_alert=True)
+            try:
+                await query.answer("❌ Membership not detected! Please join the group first.", show_alert=True)
+            except Exception:
+                pass
             await query.edit_message_text(
                 "❌ *GROUP MEMBERSHIP NOT DETECTED!*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1667,7 +1673,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["demo_joined_verified"] = True
-        await query.answer("✅ Group membership verified!", show_alert=False)
+        try:
+            await query.answer("✅ Group membership verified!", show_alert=True)
+        except Exception:
+            pass
         await query.edit_message_text(
             "✅ *GROUP MEMBERSHIP VERIFIED!*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1793,7 +1802,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "paid_request_access":
-        trader_id = context.user_data.get("paid_trader_id", f"Paid_User_{user_id}")
+        # Try to get trader_id from user_data (if they typed it) or from already-saved paid_requests
+        trader_id = (
+            context.user_data.get("paid_trader_id")
+            or db_data.get("paid_requests", {}).get(str(user_id), {}).get("trader_id")
+            or f"Paid_User_{user_id}"
+        )
         context.user_data.clear()
         now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
 
