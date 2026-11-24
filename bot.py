@@ -19,6 +19,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
+    ChatMemberHandler,
     filters,
 )
 
@@ -113,11 +114,15 @@ def escape_md(text: str) -> str:
 def load_db():
     default_db = {
         "admin_id": ADMIN_ID,
+        "group_chat_id": None,
+        "group_username": GROUP_USERNAME,
+        "group_link": GROUP_LINK,
         "approved_users": [],
         "rejected_users": [],
         "used_trader_ids": {},
         "paid_requests": {},
         "referral_requests": {},
+        "joined_group_users": {},
         "demo_cooldowns": {}
     }
     if os.path.exists(DB_FILE):
@@ -174,7 +179,7 @@ def authorize_user(user_id: int, trader_id: str = None):
         db_data["approved_users"].append(user_id)
     if user_id in db_data.get("rejected_users", []):
         db_data["rejected_users"].remove(user_id)
-    if trader_id and trader_id not in ["Not Provided", "Paid_User"]:
+    if trader_id and trader_id not in ["Not Provided", "Paid_User", "Screenshot Provided", "Submitted via Telegram"]:
         db_data["used_trader_ids"][str(trader_id)] = user_id
     save_db(db_data)
 
@@ -185,19 +190,177 @@ def reject_user(user_id: int):
         db_data["rejected_users"].append(user_id)
     save_db(db_data)
 
-# --- Group Membership Verification ---
+# --- Group Membership Verification & Dynamic Link Helpers ---
+def get_target_group_chat_id():
+    db_id = db_data.get("group_chat_id")
+    if db_id:
+        return db_id
+    raw = os.getenv("GROUP_CHAT_ID") or os.getenv("GROUP_USERNAME") or "ayyan_trader02"
+    raw = str(raw).strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    if "t.me/" in raw:
+        slug = raw.split("t.me/")[-1].split("/")[0].split("?")[0].strip()
+        if slug and not slug.startswith("+") and not slug.startswith("joinchat"):
+            return f"@{slug.lstrip('@')}"
+    if not raw.startswith("@") and not raw.startswith("-"):
+        return f"@{raw}"
+    return raw
+
+def get_target_group_link() -> str:
+    return db_data.get("group_link") or os.getenv("GROUP_LINK") or f"https://t.me/{db_data.get('group_username', GROUP_USERNAME)}"
+
 async def check_user_in_group(bot, user_id: int) -> bool:
+    # 1. Admin or already VIP approved users always pass smoothly
+    if user_id in db_data.get("approved_users", []) or (ADMIN_ID and user_id == ADMIN_ID):
+        return True
+
+    # 2. Check if user was already recorded via real-time join events, group message, or previous check
+    if str(user_id) in db_data.get("joined_group_users", {}):
+        return True
+
+    target_chat = get_target_group_chat_id()
     try:
-        chat_id = int(GROUP_CHAT_ID) if GROUP_CHAT_ID.lstrip("-").isdigit() else GROUP_CHAT_ID
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        if member.status in ["member", "administrator", "creator"]:
+        member = await bot.get_chat_member(chat_id=target_chat, user_id=user_id)
+        status = str(getattr(member, "status", "")).lower()
+
+        # Active member statuses in Telegram
+        if any(s in status for s in ["member", "administrator", "creator", "owner"]):
+            db_data.setdefault("joined_group_users", {})[str(user_id)] = int(datetime.now().timestamp())
+            save_db(db_data)
             return True
-        if member.status == "restricted" and getattr(member, "is_member", False):
-            return True
-        return False
+
+        if "restricted" in status:
+            is_mem = getattr(member, "is_member", True)
+            if is_mem:
+                db_data.setdefault("joined_group_users", {})[str(user_id)] = int(datetime.now().timestamp())
+                save_db(db_data)
+            return is_mem
+
+        if any(s in status for s in ["left", "kicked", "banned"]):
+            if "joined_group_users" in db_data and str(user_id) in db_data["joined_group_users"]:
+                db_data["joined_group_users"].pop(str(user_id), None)
+                save_db(db_data)
+            return False
+
+        return True
     except Exception as e:
-        logger.warning(f"Group check error for {user_id} in {GROUP_CHAT_ID}: {e}")
-        return False
+        err_str = str(e).lower()
+        logger.warning(f"Group check warning for user {user_id} in {target_chat}: {e}")
+
+        # If error indicates bot configuration / admin rights issue in group:
+        # Don't punish or trap users for a bot setup issue!
+        if any(kw in err_str for kw in [
+            "chat not found", "admin privileges", "not enough rights",
+            "bot is not a member", "chat_admin_required", "need administrator rights"
+        ]):
+            logger.info(f"👉 Target chat {target_chat} not configured or lacks admin rights. Allowing user {user_id} smoothly.")
+            return True
+
+        # Telegram specifically confirms user is not a participant
+        if any(kw in err_str for kw in ["user not found", "not a participant", "participant_id_invalid"]):
+            return False
+
+        return True
+
+# --- Telegram Real-time Event Handlers for Force Subscription ---
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_member = update.chat_member
+    if not chat_member or not chat_member.new_chat_member or not chat_member.new_chat_member.user:
+        return
+    user_id = chat_member.new_chat_member.user.id
+    new_status = str(chat_member.new_chat_member.status).lower()
+
+    if any(s in new_status for s in ["member", "administrator", "creator", "owner", "restricted"]):
+        db_data.setdefault("joined_group_users", {})[str(user_id)] = int(datetime.now().timestamp())
+        save_db(db_data)
+        logger.info(f"✅ User {user_id} verified via ChatMember update.")
+    elif any(s in new_status for s in ["left", "kicked", "banned"]):
+        if "joined_group_users" in db_data and str(user_id) in db_data["joined_group_users"]:
+            db_data["joined_group_users"].pop(str(user_id), None)
+            save_db(db_data)
+            logger.info(f"ℹ️ User {user_id} left group. Removed from verified cache.")
+
+async def on_my_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    my_member = update.my_chat_member
+    if not my_member or not my_member.chat:
+        return
+    chat = my_member.chat
+    new_status = str(getattr(my_member.new_chat_member, "status", "")).lower()
+
+    if any(s in new_status for s in ["administrator", "creator", "member"]):
+        db_data["group_chat_id"] = chat.id
+        if chat.username:
+            db_data["group_username"] = chat.username
+            db_data["group_link"] = f"https://t.me/{chat.username}"
+        save_db(db_data)
+        logger.info(f"🎉 Bot added to chat '{chat.title}' (ID: {chat.id}). Auto-saved group configuration!")
+        adm_chat = get_admin_chat_id()
+        if adm_chat:
+            try:
+                await context.bot.send_message(
+                    chat_id=adm_chat,
+                    text=(
+                        f"📢 *BOT CONNECTED TO GROUP/CHANNEL!*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"📛 *Title :* {escape_md(chat.title or 'Unknown')}\n"
+                        f"🆔 *Chat ID :* `{chat.id}`\n"
+                        f"🔗 *Username :* `@{chat.username or 'none'}`\n\n"
+                        f"✅ Auto-verification for Demo Signals is now active for this group!"
+                    ),
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type in ["group", "supergroup", "channel"]:
+        # Auto-record group chat_id
+        if db_data.get("group_chat_id") != update.effective_chat.id:
+            db_data["group_chat_id"] = update.effective_chat.id
+            save_db(db_data)
+        user_id = update.effective_user.id
+        if str(user_id) not in db_data.get("joined_group_users", {}):
+            db_data.setdefault("joined_group_users", {})[str(user_id)] = int(datetime.now().timestamp())
+            save_db(db_data)
+
+async def notify_admin_new_request(bot, req_type: str, user_id: int, req_data: dict):
+    adm_chat = get_admin_chat_id()
+    if not adm_chat:
+        logger.warning(f"No ADMIN_ID configured yet. Request from user {user_id} saved in queue.")
+        return
+
+    title = "🤝 NEW REFERRAL REQUEST ($50 DEPOSIT)" if req_type == "ref" else "💳 NEW PAID USER REQUEST"
+    name = escape_md(req_data.get("full_name", "User"))
+    uname = escape_md(req_data.get("username", "No Username"))
+    t_id = escape_md(str(req_data.get("trader_id", "Not Provided")))
+    time_str = escape_md(str(req_data.get("time", "N/A")))
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❌ Reject", callback_data=f"adm_dec_{req_type}_rej_{user_id}_0"),
+            InlineKeyboardButton("✅ Approve", callback_data=f"adm_dec_{req_type}_app_{user_id}_0")
+        ],
+        [InlineKeyboardButton("📋 View Requests Queue", callback_data=f"admin_{req_type}_0")]
+    ])
+
+    text = (
+        f"*{title}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 *Name :* {name}\n"
+        f"🔗 *Username :* {uname}\n"
+        f"🆔 *Telegram ID :* `{user_id}`\n"
+        f"📊 *Trader ID :* `{t_id}`\n"
+        f"⏰ *Time :* `{time_str}`\n\n"
+        f"Click below to Approve or Reject:"
+    )
+
+    try:
+        await bot.send_message(chat_id=adm_chat, text=text, parse_mode='Markdown', reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Failed to notify admin {adm_chat}: {e}")
 
 # ============================================================================
 # STRICTLY VERIFIED QUOTEX LIVE CURRENCY PAIRS ONLY
@@ -671,9 +834,10 @@ def generate_future_signals_list(mode="otc", total_signals=15):
 # ============================================================================
 def get_access_gate_kb(is_adm: bool = False):
     """Initial 5 buttons shown when a normal user opens the bot."""
+    group_link = get_target_group_link()
     rows = [
         [
-            InlineKeyboardButton("📢 Join Group", url=GROUP_LINK),
+            InlineKeyboardButton("📢 Join Group", url=group_link),
             InlineKeyboardButton("💬 DM Admin", url=ADMIN_URL)
         ],
         [InlineKeyboardButton("🎯 Demo Signal", callback_data="gate_demo")],
@@ -686,7 +850,7 @@ def get_access_gate_kb(is_adm: bool = False):
 
 def get_demo_join_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Group", url=GROUP_LINK)],
+        [InlineKeyboardButton("📢 Join Group", url=get_target_group_link())],
         [InlineKeyboardButton("✅ Check Joined", callback_data="demo_check_joined")],
         [InlineKeyboardButton("⬅️ Back", callback_data="gate_home")]
     ])
@@ -699,16 +863,16 @@ def get_demo_generate_kb():
 
 def get_paid_signals_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Done Payment", callback_data="paid_done")],
+        [InlineKeyboardButton("✍️ Submit Trader ID / Transaction", callback_data="paid_done")],
         [
             InlineKeyboardButton("💬 DM Admin", url=ADMIN_URL),
-            InlineKeyboardButton("⬅️ Back", callback_data="gate_home")
+            InlineKeyboardButton("⬅️ Back to Menu", callback_data="gate_home")
         ]
     ])
 
 def get_paid_request_access_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩 Request Access", callback_data="paid_request_access")],
+        [InlineKeyboardButton("✍️ Submit Trader ID", callback_data="paid_done")],
         [
             InlineKeyboardButton("💬 DM Admin (Send Screenshot)", url=ADMIN_URL),
             InlineKeyboardButton("⬅️ Back", callback_data="gate_paid")
@@ -718,16 +882,16 @@ def get_paid_request_access_kb():
 def get_free_access_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Create Quotex Account ($50 Deposit)", url=QUOTEX_PARTNER_LINK)],
-        [InlineKeyboardButton("✅ Account Created", callback_data="free_account_created")],
+        [InlineKeyboardButton("✍️ Submit Quotex Trader ID", callback_data="free_account_created")],
+        [InlineKeyboardButton("⚡ Submit Request Directly", callback_data="free_submit_direct")],
         [
             InlineKeyboardButton("💬 DM Admin", url=ADMIN_URL),
-            InlineKeyboardButton("⬅️ Back", callback_data="gate_home")
+            InlineKeyboardButton("⬅️ Back to Menu", callback_data="gate_home")
         ]
     ])
 
 def get_free_check_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Check", callback_data="free_check_id")],
         [InlineKeyboardButton("✍️ Re-enter Trader ID", callback_data="free_account_created")],
         [InlineKeyboardButton("⬅️ Back", callback_data="gate_free")]
     ])
@@ -748,8 +912,9 @@ def get_main_dashboard_kb(user=None):
             [InlineKeyboardButton("📋 FUTURE SIGNALS LIST", callback_data="menu_future_otc")],
             [
                 InlineKeyboardButton(f"👥 Approved Users ({vip_cnt})", callback_data="admin_users_list"),
-                InlineKeyboardButton("👁️ Preview User Menu", callback_data="gate_home")
-            ]
+                InlineKeyboardButton("📢 Group Status", callback_data="admin_group_status")
+            ],
+            [InlineKeyboardButton("👁️ Preview User Gate Menu", callback_data="gate_home")]
         ])
 
     # Normal Approved VIP User Dashboard
@@ -762,7 +927,7 @@ def get_main_dashboard_kb(user=None):
             InlineKeyboardButton("📋 FUTURE SIGNALS LIST", callback_data="menu_future_otc")
         ],
         [
-            InlineKeyboardButton("📢 Join Group", url=GROUP_LINK),
+            InlineKeyboardButton("📢 Join Group", url=get_target_group_link()),
             InlineKeyboardButton("💬 DM Admin", url=ADMIN_URL)
         ]
     ])
@@ -1086,16 +1251,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if check_and_register_admin(user):
+    global ADMIN_ID
+    # Auto-claim if no admin registered yet, or if already matches admin credentials
+    if get_admin_chat_id() == 0 or check_and_register_admin(user):
+        ADMIN_ID = user.id
+        db_data["admin_id"] = user.id
+        if user.id not in db_data.get("approved_users", []):
+            db_data.setdefault("approved_users", []).append(user.id)
+        save_db(db_data)
         await update.message.reply_text(
-            get_dashboard_text(user),
+            f"👑 *ADMIN PRIVILEGES ACTIVE*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Admin: *{escape_md(user.full_name)}*\n"
+            f"🆔 Telegram ID: `{user.id}`\n\n"
+            f"You will receive immediate alerts whenever a user requests Paid or Referral access!",
             parse_mode='Markdown',
             reply_markup=get_main_dashboard_kb(user),
             disable_web_page_preview=True
         )
     else:
         await update.message.reply_text(
-            f"⛔ You are not authorized as Admin. Your Telegram ID is `{user.id}`.",
+            f"⛔ *UNAUTHORIZED ADMIN ACCESS*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Your Telegram ID: `{user.id}`\n"
+            f"Your Username: `@{user.username or 'none'}`\n\n"
+            f"Configured Admin Username: `@{ADMIN_USERNAME}`\n\n"
+            f"💡 To set this account as Super Admin, add `ADMIN_ID={user.id}` to your Railway Environment Variables and redeploy!",
             parse_mode='Markdown'
         )
 
@@ -1128,72 +1309,168 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not check_and_register_admin(user):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("⚠️ *Usage:* `/removeuser <Telegram_User_ID>`", parse_mode='Markdown')
+        return
+    target_uid = int(context.args[0])
+    reject_user(target_uid)
+    await update.message.reply_text(f"🚫 *User `{target_uid}` VIP Access has been revoked.*", parse_mode='Markdown')
+
+async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not check_and_register_admin(user):
+        return
+
+    chat = update.effective_chat
+    if chat and chat.type in ["group", "supergroup", "channel"]:
+        db_data["group_chat_id"] = chat.id
+        if chat.username:
+            db_data["group_username"] = chat.username
+            db_data["group_link"] = f"https://t.me/{chat.username}"
+        save_db(db_data)
+        await update.message.reply_text(
+            f"✅ *OFFICIAL GROUP CONNECTED!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📛 *Title :* {escape_md(chat.title or 'Group')}\n"
+            f"🆔 *Chat ID :* `{chat.id}`\n\n"
+            f"Demo Signal join verification is now linked to this group!",
+            parse_mode='Markdown'
+        )
+    else:
+        if context.args:
+            arg = context.args[0].strip()
+            db_data["group_chat_id"] = int(arg) if arg.lstrip("-").isdigit() else arg
+            save_db(db_data)
+            await update.message.reply_text(f"✅ *Group Chat ID updated to:* `{arg}`", parse_mode='Markdown')
+        else:
+            cur = get_target_group_chat_id()
+            cur_link = get_target_group_link()
+            await update.message.reply_text(
+                f"📢 *CURRENT GROUP SETTINGS*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 *Chat ID :* `{cur}`\n"
+                f"🔗 *Link :* {cur_link}\n\n"
+                f"💡 *How to link a group or channel:*\n"
+                f"1. Add this bot as an Admin in your group or channel.\n"
+                f"2. Send `/setgroup` inside the group.\n"
+                f"3. Or in this DM chat, type: `/setgroup <numeric_chat_id_or_@username>`",
+                parse_mode='Markdown'
+            )
+
+async def setgrouplink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not check_and_register_admin(user):
+        return
+    if not context.args:
+        cur_link = get_target_group_link()
+        await update.message.reply_text(f"📢 *Current Group Link:* {cur_link}\n\nTo update, type: `/setgrouplink <URL>`", parse_mode='Markdown')
+        return
+    new_link = context.args[0].strip()
+    db_data["group_link"] = new_link
+    save_db(db_data)
+    await update.message.reply_text(f"✅ *Group Link updated to:*\n{new_link}", parse_mode='Markdown')
+
+# --- Photo / Screenshot Handler ---
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message or not update.message.photo:
+        return
+    user_id = user.id
+    if is_user_authorized(user):
+        await update.message.reply_text("📸 *Screenshot received!* You already have full VIP access.", parse_mode='Markdown')
+        return
+
+    caption = update.message.caption or ""
+    now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
+    uname = f"@{user.username}" if user.username else "No Username"
+    fname = user.full_name or "User"
+
+    match = re.search(r'(\d{5,15})', caption)
+    t_id = match.group(1) if match else "Screenshot Provided"
+
+    state = context.user_data.get("state")
+    req_type = "paid" if state == "awaiting_paid_trader_id" else "ref"
+    storage_key = "paid_requests" if req_type == "paid" else "referral_requests"
+
+    req_entry = {
+        "user_id": user_id,
+        "username": uname,
+        "full_name": fname,
+        "trader_id": t_id,
+        "time": now_str,
+        "has_screenshot": True
+    }
+    db_data.setdefault(storage_key, {})[str(user_id)] = req_entry
+    save_db(db_data)
+
+    adm_chat = get_admin_chat_id()
+    if adm_chat:
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("❌ Reject", callback_data=f"adm_dec_{req_type}_rej_{user_id}_0"),
+                InlineKeyboardButton("✅ Approve", callback_data=f"adm_dec_{req_type}_app_{user_id}_0")
+            ],
+            [InlineKeyboardButton("📋 View Requests Queue", callback_data=f"admin_{req_type}_0")]
+        ])
+        photo_file_id = update.message.photo[-1].file_id
+        admin_caption = (
+            f"📸 *NEW {'PAID PAYMENT' if req_type == 'paid' else 'PARTNER DEPOSIT'} SCREENSHOT*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 *Name :* {escape_md(fname)}\n"
+            f"🔗 *Username :* {escape_md(uname)}\n"
+            f"🆔 *Telegram ID :* `{user_id}`\n"
+            f"📊 *Trader ID / Note :* `{escape_md(t_id)}`\n"
+            f"⏰ *Time :* `{escape_md(now_str)}`\n\n"
+            f"Click below to Approve or Reject:"
+        )
+        try:
+            await context.bot.send_photo(
+                chat_id=adm_chat,
+                photo=photo_file_id,
+                caption=admin_caption,
+                parse_mode='Markdown',
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.error(f"Failed to forward photo to admin: {e}")
+
+    await update.message.reply_text(
+        "📸 *DEPOSIT SCREENSHOT RECEIVED!*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 *Trader ID / Note :* `{escape_md(t_id)}`\n"
+        f"📌 *Status :* `Pending Admin Verification`\n\n"
+        "Your screenshot has been forwarded directly to Admin @Ayyan_trader01 for deposit verification.\n\n"
+        "🔔 _You will receive an automatic message here as soon as your access is approved!_",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 DM Admin", url=ADMIN_URL)],
+            [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
+        ])
+    )
+
 # --- Text Message Handler ---
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user or not update.message or not update.message.text:
+        return
+
+    # If message is in group or channel, record user and group ID
+    if update.effective_chat and update.effective_chat.type in ["group", "supergroup", "channel"]:
+        await on_group_message(update, context)
+        return
+
     user_id = user.id
+    username_display = f"@{user.username}" if user.username else "No Username"
+    full_name_display = user.full_name or "User"
     text = update.message.text.strip()
     state = context.user_data.get("state")
+    now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
 
-    # 1. Free Permanent Access: User is entering their Trader ID
-    if state == "awaiting_free_trader_id":
-        match = re.search(r'\b(\d{5,15})\b', text)
-        if not match:
-            await update.message.reply_text(
-                "⚠️ *INVALID TRADER ID*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Please enter a valid numeric *Quotex Trader ID* (for example: `95420333`).",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="gate_free")]])
-            )
-            return
-
-        trader_id = match.group(1)
-        used_by = db_data.get("used_trader_ids", {}).get(trader_id)
-        if used_by and used_by != user_id:
-            await update.message.reply_text(
-                "⛔ *TRADER ID ALREADY USED*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Trader ID `{trader_id}` is already registered to another user. Please register your own Quotex account via our partner link.",
-                parse_mode='Markdown',
-                reply_markup=get_free_access_kb()
-            )
-            return
-
-        context.user_data["free_trader_id"] = trader_id
-        await update.message.reply_text(
-            "✅ *TRADER ID RECEIVED*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 *Your Trader ID :* `{trader_id}`\n\n"
-            "Click the *Check* button below to submit your Trader ID for verification and approval:",
-            parse_mode='Markdown',
-            reply_markup=get_free_check_kb()
-        )
-        return
-
-    # 2. Paid Signals: User enters their Trader ID before clicking Request Access
-    if state == "awaiting_paid_trader_id":
-        clean_id = re.sub(r'[^a-zA-Z0-9_-]', '', text)[:25]
-        if not clean_id:
-            await update.message.reply_text(
-                "⚠️ Please enter a valid *Trader ID* or click *Request Access* below.",
-                parse_mode='Markdown',
-                reply_markup=get_paid_request_access_kb()
-            )
-            return
-
-        context.user_data["paid_trader_id"] = clean_id
-        await update.message.reply_text(
-            "✅ *TRADER ID SAVED FOR PAID REQUEST*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 *Trader ID :* `{escape_md(clean_id)}`\n\n"
-            "Now click *Request Access* below and make sure you have sent your payment screenshot to the Admin!",
-            parse_mode='Markdown',
-            reply_markup=get_paid_request_access_kb()
-        )
-        return
-
-    # 3. Custom Signal Count: User enters how many signals they want (e.g. 50, 70, 100)
+    # 1. Custom Signal Count: User enters how many signals they want (e.g. 50, 70, 100)
     if state == "awaiting_custom_signal_count":
         mode = context.user_data.get("custom_mode", "otc")
         if not text.isdigit() or int(text) < 1:
@@ -1230,6 +1507,87 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             get_post_future_kb(mode, count)
         )
         return
+
+    # 2. Paid Signals: User enters Trader ID / Transaction Hash
+    if state == "awaiting_paid_trader_id":
+        clean_id = re.sub(r'[^a-zA-Z0-9_-]', '', text)[:35]
+        if not clean_id:
+            clean_id = f"Paid_User_{user_id}"
+
+        context.user_data.clear()
+        req_entry = {
+            "user_id": user_id,
+            "username": username_display,
+            "full_name": full_name_display,
+            "trader_id": clean_id,
+            "time": now_str
+        }
+        db_data.setdefault("paid_requests", {})[str(user_id)] = req_entry
+        save_db(db_data)
+
+        # Notify Admin immediately
+        await notify_admin_new_request(context.bot, "paid", user_id, req_entry)
+
+        await update.message.reply_text(
+            "✅ *PAID ACCESS REQUEST SUBMITTED!*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 *Trader ID / Hash :* `{escape_md(clean_id)}`\n"
+            f"📌 *Status :* `Pending Admin Verification`\n\n"
+            f"Your request has been sent to the Admin.\n"
+            f"📸 *Important:* Please send your payment screenshot to @{escape_md(ADMIN_USERNAME)} if not already sent.\n\n"
+            "🔔 _You will receive an automatic notification as soon as the Admin approves your VIP access!_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Send Screenshot to Admin", url=ADMIN_URL)],
+                [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
+            ])
+        )
+        return
+
+    # 3. Unauthorized User Sending Trader ID (Quotex Partner Account Submission)
+    if not is_user_authorized(user):
+        # Check if the message contains any 5-15 digit number (Quotex Trader ID)
+        match = re.search(r'(\d{5,15})', text)
+        if match:
+            trader_id = match.group(1)
+        elif state == "awaiting_free_trader_id":
+            trader_id = re.sub(r'[^a-zA-Z0-9_-]', '', text)[:35]
+            if not trader_id:
+                trader_id = f"User_{user_id}"
+        else:
+            trader_id = None
+
+        if trader_id:
+            context.user_data.clear()
+            req_entry = {
+                "user_id": user_id,
+                "username": username_display,
+                "full_name": full_name_display,
+                "trader_id": trader_id,
+                "time": now_str
+            }
+            db_data.setdefault("referral_requests", {})[str(user_id)] = req_entry
+            save_db(db_data)
+
+            # Notify Admin immediately
+            await notify_admin_new_request(context.bot, "ref", user_id, req_entry)
+
+            await update.message.reply_text(
+                "✅ *QUOTEX TRADER ID SUBMITTED!*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 *Trader ID :* `{escape_md(trader_id)}`\n"
+                f"👤 *Username :* {escape_md(username_display)}\n"
+                f"📌 *Status :* `Pending Admin Verification`\n\n"
+                "Your Trader ID has been sent directly to Admin @Ayyan_trader01 to verify your partner account & $50 deposit.\n\n"
+                "🔔 _You will receive an automatic message here as soon as your access is approved!_",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📸 Send Deposit Screenshot to Admin", url=ADMIN_URL)],
+                    [InlineKeyboardButton("💎 Switch to Paid VIP Access ($20 USDT)", callback_data="paid_request_access")],
+                    [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
+                ])
+            )
+            return
 
     # Default response for authorized vs unauthorized users
     if is_user_authorized(user):
@@ -1294,17 +1652,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "demo_check_joined":
         joined = await check_user_in_group(context.bot, user_id)
         if not joined:
+            await query.answer("❌ Membership not detected! Please join the group first.", show_alert=True)
             await query.edit_message_text(
                 "❌ *GROUP MEMBERSHIP NOT DETECTED!*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 "You have not joined our official group yet. Joining is compulsory to use Demo Signals.\n\n"
-                "👉 Please click *Join Group* below, join the group, and then press *Check Joined* again:",
+                f"1️⃣ Click *Join Group* below to join:\n{get_target_group_link()}\n\n"
+                "2️⃣ Then tap *Check Joined* again to unlock your signal!\n\n"
+                "💡 _Tip: If you already joined, wait 3-5 seconds and tap Check Joined again._",
                 parse_mode='Markdown',
                 reply_markup=get_demo_join_kb(),
                 disable_web_page_preview=True
             )
             return
 
+        context.user_data["demo_joined_verified"] = True
+        await query.answer("✅ Group membership verified!", show_alert=False)
         await query.edit_message_text(
             "✅ *GROUP MEMBERSHIP VERIFIED!*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1316,16 +1679,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "demo_generate_signal":
-        joined = await check_user_in_group(context.bot, user_id)
-        if not joined:
-            await query.edit_message_text(
-                "❌ *YOU LEFT THE GROUP!*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Joining our group is compulsory for Demo Signals. Please rejoin and click *Check Joined*:",
-                parse_mode='Markdown',
-                reply_markup=get_demo_join_kb()
-            )
-            return
+        # Check cache or user data first so verified users aren't falsely rejected
+        if not context.user_data.get("demo_joined_verified") and str(user_id) not in db_data.get("joined_group_users", {}):
+            joined = await check_user_in_group(context.bot, user_id)
+            if not joined:
+                await query.edit_message_text(
+                    "❌ *GROUP MEMBERSHIP REQUIRED!*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "Joining our official group is compulsory for Demo Signals. Please join and click *Check Joined*:",
+                    parse_mode='Markdown',
+                    reply_markup=get_demo_join_kb()
+                )
+                return
 
         now_ts = int(datetime.now(timezone.utc).timestamp())
         last_demo_ts = db_data.get("demo_cooldowns", {}).get(str(user_id), 0)
@@ -1409,68 +1774,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "paid_done":
         context.user_data["state"] = "awaiting_paid_trader_id"
-        context.user_data["paid_trader_id"] = context.user_data.get("paid_trader_id", "Paid_User")
         done_text = (
-            "✅ *PAYMENT COMPLETED — FINAL STEP*\n"
+            "💳 *SUBMIT PAYMENT / TRADER ID*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "1️⃣ Please *type and send your Quotex Trader ID* in this chat right now (or tap *Request Access* directly below).\n"
-            "2️⃣ Click *Request Access* to submit your request to the Admin dashboard.\n"
-            f"3️⃣ Send your *payment screenshot* to @{escape_md(ADMIN_USERNAME)} so the Admin can verify and approve your unlimited access!"
+            "1️⃣ Please *type and send your Quotex Trader ID* (or Transaction Hash) in this chat right now.\n"
+            "2️⃣ Or tap *Submit Request Directly* below to notify the Admin immediately.\n"
+            f"3️⃣ Make sure to send your payment screenshot to @{escape_md(ADMIN_USERNAME)}!"
         )
         await query.edit_message_text(
             done_text,
             parse_mode='Markdown',
-            reply_markup=get_paid_request_access_kb()
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Submit Request Directly", callback_data="paid_request_access")],
+                [InlineKeyboardButton("📸 Send Screenshot to Admin", url=ADMIN_URL)],
+                [InlineKeyboardButton("⬅️ Back", callback_data="gate_paid")]
+            ])
         )
         return
 
     if data == "paid_request_access":
-        trader_id = context.user_data.get("paid_trader_id", "Paid_User")
+        trader_id = context.user_data.get("paid_trader_id", f"Paid_User_{user_id}")
         context.user_data.clear()
         now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
 
-        db_data["paid_requests"][str(user_id)] = {
+        req_entry = {
             "user_id": user_id,
             "username": username_display,
             "full_name": full_name_display,
             "trader_id": trader_id,
             "time": now_str
         }
+        db_data.setdefault("paid_requests", {})[str(user_id)] = req_entry
         save_db(db_data)
 
-        adm_chat = get_admin_chat_id()
-        if adm_chat:
-            admin_alert_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("❌ Reject", callback_data=f"adm_dec_paid_rej_{user_id}_0"),
-                    InlineKeyboardButton("✅ Approve", callback_data=f"adm_dec_paid_app_{user_id}_0")
-                ],
-                [InlineKeyboardButton("💳 Open Paid User Requests", callback_data="admin_paid_0")]
-            ])
-            try:
-                await context.bot.send_message(
-                    chat_id=adm_chat,
-                    text=(
-                        "💳 *NEW PAID USER REQUEST*\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"👤 *Name :* {escape_md(full_name_display)}\n"
-                        f"🔗 *Username :* {escape_md(username_display)}\n"
-                        f"🆔 *Telegram ID :* `{user_id}`\n"
-                        f"📊 *Trader ID :* `{escape_md(trader_id)}`\n"
-                        f"⏰ *Time :* `{now_str}`"
-                    ),
-                    parse_mode='Markdown',
-                    reply_markup=admin_alert_kb
-                )
-            except Exception as e:
-                logger.error(f"Admin paid notify error: {e}")
+        # Notify Admin immediately
+        await notify_admin_new_request(context.bot, "paid", user_id, req_entry)
 
         await query.edit_message_text(
             "⏳ *PAID ACCESS REQUEST SUBMITTED!*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Your request has been sent to the Admin for approval.\n"
-            f"📸 *Important:* Please make sure you have sent your payment screenshot to @{escape_md(ADMIN_USERNAME)}.\n\n"
-            "🔒 _Approval is compulsory. As soon as the Admin approves your payment, you will receive a notification and unlock unlimited lifetime access!_",
+            f"📊 *Trader ID / Status :* `{escape_md(trader_id)}`\n"
+            f"📌 *Status :* `Pending Admin Approval`\n\n"
+            "Your request has been sent to the Admin.\n"
+            f"📸 *Compulsory:* Please send your payment screenshot to @{escape_md(ADMIN_USERNAME)} so the Admin can verify and activate your access!\n\n"
+            "🔔 _You will receive an automatic message here as soon as your access is approved!_",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📸 Send Screenshot to Admin", url=ADMIN_URL)],
@@ -1481,15 +1828,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- FREE PERMANENT ACCESS FLOW ---
     if data == "gate_free":
-        context.user_data.clear()
+        context.user_data["state"] = "awaiting_free_trader_id"
         free_text = (
             "🆓 *FREE PERMANENT ACCESS*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "Follow these steps to unlock unlimited VIP signals for free:\n\n"
             "1️⃣ Create a new Quotex account through our *official partner link* below.\n"
             "2️⃣ Deposit at least *$50* into your Quotex account.\n"
-            "3️⃣ Click *Account Created* below, enter your *Trader ID*, and press *Check*.\n\n"
-            "🔒 _Once submitted, our Admin will verify your referral account and deposit and approve your permanent access._"
+            "3️⃣ Type and send your *Quotex Trader ID* (or deposit screenshot) directly in this chat!\n\n"
+            "🔒 _Once submitted, Admin @Ayyan_trader01 will verify your partner account & deposit and approve your permanent access._"
         )
         await query.edit_message_text(
             free_text,
@@ -1505,9 +1852,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✍️ *ENTER YOUR QUOTEX TRADER ID*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "Please type and send your numeric *Quotex Trader ID* (for example: `95420333`) in this chat right now.\n\n"
-            "After entering your Trader ID, press the *Check* button that appears!",
+            "⚡ As soon as you send your ID, your request will be automatically registered and sent directly to the Admin!",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="gate_free")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Submit Request Directly", callback_data="free_submit_direct")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="gate_free")]
+            ])
+        )
+        return
+
+    if data == "free_submit_direct":
+        context.user_data.clear()
+        now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
+        req_entry = {
+            "user_id": user_id,
+            "username": username_display,
+            "full_name": full_name_display,
+            "trader_id": "Submitted via Telegram",
+            "time": now_str
+        }
+        db_data.setdefault("referral_requests", {})[str(user_id)] = req_entry
+        save_db(db_data)
+
+        await notify_admin_new_request(context.bot, "ref", user_id, req_entry)
+
+        await query.edit_message_text(
+            "✅ *PARTNER ACCESS REQUEST SUBMITTED!*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 *Username :* {escape_md(username_display)}\n"
+            f"🆔 *Telegram ID :* `{user_id}`\n"
+            f"📌 *Status :* `Pending Admin Verification`\n\n"
+            "Your request has been sent to Admin @Ayyan_trader01.\n"
+            "📸 *Please send your deposit screenshot to the Admin if you haven't already!*\n\n"
+            "🔔 _You will receive an automatic notification as soon as your access is approved!_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Send Screenshot to Admin", url=ADMIN_URL)],
+                [InlineKeyboardButton("✍️ Type Trader ID Instead", callback_data="free_account_created")],
+                [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
+            ])
         )
         return
 
@@ -1516,7 +1899,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not trader_id:
             context.user_data["state"] = "awaiting_free_trader_id"
             await query.edit_message_text(
-                "⚠️ *Please type and send your numeric Quotex Trader ID first:*",
+                "⚠️ *Please type and send your numeric Quotex Trader ID in this chat:*",
                 parse_mode='Markdown',
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="gate_free")]])
             )
@@ -1525,53 +1908,95 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
 
-        db_data["referral_requests"][str(user_id)] = {
+        req_entry = {
             "user_id": user_id,
             "username": username_display,
             "full_name": full_name_display,
             "trader_id": trader_id,
             "time": now_str
         }
+        db_data.setdefault("referral_requests", {})[str(user_id)] = req_entry
         save_db(db_data)
 
-        adm_chat = get_admin_chat_id()
-        if adm_chat:
-            admin_alert_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("❌ Reject", callback_data=f"adm_dec_ref_rej_{user_id}_0"),
-                    InlineKeyboardButton("✅ Approve", callback_data=f"adm_dec_ref_app_{user_id}_0")
-                ],
-                [InlineKeyboardButton("🤝 Open Referral Requests", callback_data="admin_ref_0")]
-            ])
-            try:
-                await context.bot.send_message(
-                    chat_id=adm_chat,
-                    text=(
-                        "🤝 *NEW REFERRAL REQUEST ($50 DEPOSIT)*\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"👤 *Name :* {escape_md(full_name_display)}\n"
-                        f"🔗 *Username :* {escape_md(username_display)}\n"
-                        f"🆔 *Telegram ID :* `{user_id}`\n"
-                        f"📊 *Trader ID :* `{escape_md(trader_id)}`\n"
-                        f"⏰ *Time :* `{now_str}`"
-                    ),
-                    parse_mode='Markdown',
-                    reply_markup=admin_alert_kb
-                )
-            except Exception as e:
-                logger.error(f"Admin referral notify error: {e}")
+        # Notify admin
+        await notify_admin_new_request(context.bot, "ref", user_id, req_entry)
 
         await query.edit_message_text(
             "⏳ *REFERRAL REQUEST SUBMITTED!*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊 *Trader ID :* `{escape_md(trader_id)}`\n"
             f"👤 *Username :* {escape_md(username_display)}\n"
+            f"📌 *Status :* `Pending Admin Verification`\n\n"
+            "Your Trader ID has been sent to the Admin to verify your account registration and $50 deposit.\n\n"
+            "🔔 _You will receive an automatic message here as soon as your access is approved!_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Send Deposit Screenshot to Admin", url=ADMIN_URL)],
+                [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
+            ])
+        )
+        return
+
+    # Direct detection callbacks for users who just type numbers
+    if data == "submit_detected_ref":
+        detected_id = context.user_data.get("temp_detected_id", f"User_{user_id}")
+        context.user_data.clear()
+        now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
+        req_entry = {
+            "user_id": user_id,
+            "username": username_display,
+            "full_name": full_name_display,
+            "trader_id": detected_id,
+            "time": now_str
+        }
+        db_data.setdefault("referral_requests", {})[str(user_id)] = req_entry
+        save_db(db_data)
+
+        await notify_admin_new_request(context.bot, "ref", user_id, req_entry)
+
+        await query.edit_message_text(
+            "⏳ *REFERRAL REQUEST SUBMITTED!*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 *Trader ID :* `{escape_md(str(detected_id))}`\n"
+            f"👤 *Username :* {escape_md(username_display)}\n"
             f"📌 *Status :* `Pending Admin Approval`\n\n"
-            "Your Trader ID has been sent to the Admin for verification. Until the Admin approves your request, you cannot use the VIP bot.\n\n"
+            "Your Trader ID has been sent to the Admin to verify your account registration and $50 deposit.\n\n"
             "🔔 _You will receive an automatic message here as soon as your request is approved!_",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 DM Admin", url=ADMIN_URL)],
+                [InlineKeyboardButton("📸 Send Deposit Screenshot to Admin", url=ADMIN_URL)],
+                [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
+            ])
+        )
+        return
+
+    if data == "submit_detected_paid":
+        detected_id = context.user_data.get("temp_detected_id", f"Paid_User_{user_id}")
+        context.user_data.clear()
+        now_str = datetime.now(PKT).strftime("%d %b %Y %I:%M %p")
+        req_entry = {
+            "user_id": user_id,
+            "username": username_display,
+            "full_name": full_name_display,
+            "trader_id": detected_id,
+            "time": now_str
+        }
+        db_data.setdefault("paid_requests", {})[str(user_id)] = req_entry
+        save_db(db_data)
+
+        await notify_admin_new_request(context.bot, "paid", user_id, req_entry)
+
+        await query.edit_message_text(
+            "⏳ *PAID ACCESS REQUEST SUBMITTED!*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 *Trader ID / Hash :* `{escape_md(str(detected_id))}`\n"
+            f"📌 *Status :* `Pending Admin Approval`\n\n"
+            "Your request has been submitted to the Admin.\n"
+            f"📸 *Compulsory:* Please send your payment screenshot to @{escape_md(ADMIN_USERNAME)}.\n\n"
+            "🔔 _You will receive an automatic notification as soon as the Admin approves your VIP access!_",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Send Screenshot to Admin", url=ADMIN_URL)],
                 [InlineKeyboardButton("⬅️ Back to Home", callback_data="gate_home")]
             ])
         )
@@ -1580,6 +2005,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # =========================================================================
     # 2. ADMIN DASHBOARD ACTIONS (PAID REQUESTS, REFERRAL REQUESTS, USERS LIST)
     # =========================================================================
+    if data == "admin_group_status":
+        if not is_adm:
+            return
+        cur_chat = get_target_group_chat_id()
+        cur_link = get_target_group_link()
+        total_verified = len(db_data.get("joined_group_users", {}))
+        
+        status_info = "Checking..."
+        try:
+            bot_self = await context.bot.get_chat_member(chat_id=cur_chat, user_id=context.bot.id)
+            bot_role = getattr(bot_self, "status", "unknown")
+            status_info = f"✅ Connected (Bot is {str(bot_role).upper()})"
+        except Exception as ex:
+            status_info = f"⚠️ Not Verified ({ex})"
+
+        status_text = (
+            "📢 *OFFICIAL GROUP SETTINGS & STATUS*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 *Target Chat ID :* `{cur_chat}`\n"
+            f"🔗 *Group Link :* {cur_link}\n"
+            f"🤖 *Bot In Group Status :* `{status_info}`\n"
+            f"👥 *Cached Verified Users :* `{total_verified}`\n\n"
+            "💡 *How to link a new group or channel:*\n"
+            "1. Add this bot as an Admin in your group or channel.\n"
+            "2. Send `/setgroup` inside the group to connect automatically.\n"
+            "3. Or type `/setgrouplink <invite_url>` in DM to change the link."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_group_status")],
+            [InlineKeyboardButton("⬅️ Back to Admin Dashboard", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(status_text, parse_mode='Markdown', reply_markup=kb, disable_web_page_preview=True)
+        return
+
     if data == "admin_users_list":
         if not is_adm:
             return
@@ -1618,6 +2077,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage_key = "paid_requests" if req_type == "paid" else "referral_requests"
         req_info = db_data.get(storage_key, {}).pop(target_uid_str, None)
         t_id = req_info.get("trader_id", "Not Provided") if req_info else "Not Provided"
+        fname = req_info.get("full_name", "User") if req_info else "User"
+        uname = req_info.get("username", "No Username") if req_info else "No Username"
 
         if decision == "app":
             authorize_user(target_uid, t_id)
@@ -1626,9 +2087,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=target_uid,
                     text=(
-                        "🎉 *ACCESS APPROVED!*\n"
+                        "🎉 *CONGRATULATIONS! VIP ACCESS APPROVED!*\n"
                         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "✅ Your request has been *APPROVED* by the Admin! You now have *Unlimited Permanent Access* to the Ayyan Trader Bot.\n\n"
+                        "✅ Your Quotex account has been verified by the Admin!\n"
+                        "You now have *Unlimited Permanent Access* to Ayyan Trader Signals:\n"
+                        "• 🌙 24/7 OTC Currency Pairs\n"
+                        "• 📈 Live Forex Currency Pairs\n"
+                        "• 📋 Future Signals Lists (with 2-5 min gaps)\n\n"
                         "👇 Select your trading mode below to start generating signals:"
                     ),
                     parse_mode='Markdown',
@@ -1636,6 +2101,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logger.warning(f"Could not notify approved user {target_uid}: {e}")
+
+            # Check if this decision is made directly from a notification alert
+            is_direct_alert = False
+            if query.message:
+                m_txt = (query.message.text or "") + (query.message.caption or "")
+                if any(k in m_txt for k in ["NEW REFERRAL REQUEST", "NEW PAID USER REQUEST", "NEW PARTNER DEPOSIT", "NEW PAID PAYMENT"]):
+                    is_direct_alert = True
+
+            if is_direct_alert:
+                app_card = (
+                    f"✅ *REQUEST APPROVED*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"👤 *User :* {fname} ({uname})\n"
+                    f"🆔 *Telegram ID :* `{target_uid}`\n"
+                    f"📊 *Trader ID :* `{t_id}`\n\n"
+                    f"👑 VIP Permanent Access has been activated!"
+                )
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 View Requests Queue", callback_data=f"admin_{req_type}_0")],
+                    [InlineKeyboardButton("👑 Admin Dashboard", callback_data="main_menu")]
+                ])
+                try:
+                    if query.message.caption:
+                        await query.edit_message_caption(caption=app_card, parse_mode='Markdown', reply_markup=kb)
+                    else:
+                        await query.edit_message_text(text=app_card, parse_mode='Markdown', reply_markup=kb)
+                except Exception as e:
+                    logger.warning(f"Could not update alert message: {e}")
+                return
         else:
             reject_user(target_uid)
             save_db(db_data)
@@ -1643,16 +2137,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=target_uid,
                     text=(
-                        "❌ *ACCESS REQUEST REJECTED*\n"
+                        "❌ *ACCESS REQUEST NOT APPROVED*\n"
                         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        "Your access request was reviewed and *rejected* by the Admin because your payment or $50 partner deposit could not be verified.\n\n"
-                        f"If you believe this is a mistake, please contact @{escape_md(ADMIN_USERNAME)}."
+                        "Your access request could not be approved because your deposit or partner link registration could not be verified.\n\n"
+                        f"If you believe this is a mistake or already deposited, please contact @{escape_md(ADMIN_USERNAME)}."
                     ),
                     parse_mode='Markdown',
                     reply_markup=get_access_gate_kb(False)
                 )
             except Exception as e:
                 logger.warning(f"Could not notify rejected user {target_uid}: {e}")
+
+            is_direct_alert = False
+            if query.message:
+                m_txt = (query.message.text or "") + (query.message.caption or "")
+                if any(k in m_txt for k in ["NEW REFERRAL REQUEST", "NEW PAID USER REQUEST", "NEW PARTNER DEPOSIT", "NEW PAID PAYMENT"]):
+                    is_direct_alert = True
+
+            if is_direct_alert:
+                rej_card = (
+                    f"❌ *REQUEST REJECTED*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"👤 *User :* {fname} ({uname})\n"
+                    f"🆔 *Telegram ID :* `{target_uid}`\n"
+                    f"📊 *Trader ID :* `{t_id}`\n\n"
+                    f"Request marked as Rejected."
+                )
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 View Requests Queue", callback_data=f"admin_{req_type}_0")],
+                    [InlineKeyboardButton("👑 Admin Dashboard", callback_data="main_menu")]
+                ])
+                try:
+                    if query.message.caption:
+                        await query.edit_message_caption(caption=rej_card, parse_mode='Markdown', reply_markup=kb)
+                    else:
+                        await query.edit_message_text(text=rej_card, parse_mode='Markdown', reply_markup=kb)
+                except Exception as e:
+                    logger.warning(f"Could not update alert message: {e}")
+                return
 
         await render_admin_requests_view(query, req_type, idx)
         return
@@ -1915,10 +2437,16 @@ def run_bot():
     telegram_app.add_handler(CommandHandler("admin", admin_command))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
     telegram_app.add_handler(CommandHandler("adduser", adduser_command))
+    telegram_app.add_handler(CommandHandler("removeuser", removeuser_command))
+    telegram_app.add_handler(CommandHandler("setgroup", setgroup_command))
+    telegram_app.add_handler(CommandHandler("setgrouplink", setgrouplink_command))
+    telegram_app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    telegram_app.add_handler(ChatMemberHandler(on_my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
-    telegram_app.run_polling(drop_pending_updates=True)
+    telegram_app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
